@@ -8,7 +8,8 @@ public enum StatusPedido {
     public boolean podeTransicionarPara(StatusPedido destino) {
         return switch (this) {
             case CRIADO -> true;
-            case PAGO -> destino == CANCELADO;
+            // case PAGO -> destino == CANCELADO;
+            case PAGO -> true;
             case CANCELADO -> false;
         };
     }
