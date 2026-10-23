@@ -36,7 +36,7 @@ class PedidoServiceTest {
     void setUp() {
         service = new PedidoService(repository);
     }
-    
+
     @Test
     void criarCalculaTotalNoServidor() {
         when(repository.save(any(Pedido.class))).thenAnswer(inv -> inv.getArgument(0));
