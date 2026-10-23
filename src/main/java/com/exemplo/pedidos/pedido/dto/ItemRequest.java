@@ -1,6 +1,12 @@
 package com.exemplo.pedidos.pedido.dto;
 
 import java.math.BigDecimal;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
 
-public record ItemRequest(String produto, int quantidade, BigDecimal precoUnitario) {
+public record ItemRequest(
+        @NotBlank String produto,
+        @Positive int quantidade,
+        @NotNull @Positive BigDecimal precoUnitario) {
 }

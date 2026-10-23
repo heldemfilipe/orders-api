@@ -1,8 +1,13 @@
 package com.exemplo.pedidos.pedido.dto;
 
 import java.util.List;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.NotNull;
 
 import com.exemplo.pedidos.pedido.StatusPedido;
 
-public record AtualizarPedidoRequest(List<ItemRequest> itens, StatusPedido status) {
+public record AtualizarPedidoRequest(
+        @NotEmpty @Valid List<ItemRequest> itens,
+        @NotNull StatusPedido status) {
 }

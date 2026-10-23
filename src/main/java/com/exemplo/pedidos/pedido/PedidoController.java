@@ -1,6 +1,7 @@
 package com.exemplo.pedidos.pedido;
 
 import java.net.URI;
+import jakarta.validation.Valid;
 
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -33,7 +34,7 @@ public class PedidoController {
     }
 
     @PostMapping
-    public ResponseEntity<PedidoResponse> criar(@RequestBody PedidoRequest request) {
+    public ResponseEntity<PedidoResponse> criar(@Valid @RequestBody PedidoRequest request) {
         PedidoResponse criado = service.criar(request);
         URI local = ServletUriComponentsBuilder.fromCurrentRequest()
                 .path("/{id}").buildAndExpand(criado.id()).toUri();
@@ -53,7 +54,7 @@ public class PedidoController {
     }
 
     @PutMapping("/{id}")
-    public PedidoResponse atualizar(@PathVariable String id, @RequestBody AtualizarPedidoRequest request) {
+    public PedidoResponse atualizar(@PathVariable String id, @Valid @RequestBody AtualizarPedidoRequest request) {
         return service.atualizar(id, request);
     }
 
