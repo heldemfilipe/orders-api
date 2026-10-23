@@ -25,6 +25,13 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return problema;
     }
 
+    @ExceptionHandler(TransicaoStatusInvalidaException.class)
+    public ProblemDetail transicaoInvalida(TransicaoStatusInvalidaException ex) {
+        ProblemDetail problema = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+        problema.setTitle("Transição de status inválida");
+        return problema;
+    }
+
     @Override
     protected ResponseEntity<Object> handleMethodArgumentNotValid(
             MethodArgumentNotValidException ex, HttpHeaders headers,

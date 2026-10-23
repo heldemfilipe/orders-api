@@ -8,10 +8,12 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 
 import com.exemplo.pedidos.erro.PedidoNaoEncontradoException;
+import com.exemplo.pedidos.erro.TransicaoStatusInvalidaException;
 import com.exemplo.pedidos.pedido.dto.AtualizarPedidoRequest;
 import com.exemplo.pedidos.pedido.dto.ItemRequest;
 import com.exemplo.pedidos.pedido.dto.PedidoRequest;
 import com.exemplo.pedidos.pedido.dto.PedidoResponse;
+
 
 @Service
 public class PedidoService {
@@ -38,6 +40,9 @@ public class PedidoService {
 
     public PedidoResponse atualizar(String id, AtualizarPedidoRequest request) {
         Pedido pedido = buscarOuFalhar(id);
+        if (!pedido.getStatus().podeTransicionarPara(request.status())) {
+            throw new TransicaoStatusInvalidaException(pedido.getStatus(), request.status());
+        }
         List<ItemPedido> itens = converter(request.itens());
         pedido.atualizar(itens, calcularTotal(itens), request.status());
         return PedidoResponse.de(repository.save(pedido));
