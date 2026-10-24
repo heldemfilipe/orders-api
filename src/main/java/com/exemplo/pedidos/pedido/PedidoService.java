@@ -1,6 +1,5 @@
 package com.exemplo.pedidos.pedido;
 
-import java.math.BigDecimal;
 import java.util.List;
 
 import org.springframework.data.domain.Page;
@@ -26,7 +25,7 @@ public class PedidoService {
 
     public PedidoResponse criar(PedidoRequest request) {
         List<ItemPedido> itens = converter(request.itens());
-        Pedido pedido = Pedido.novo(request.clienteId(), itens, calcularTotal(itens));
+        Pedido pedido = Pedido.novo(request.clienteId(), itens, Pedido.calcularTotal(itens));
         return PedidoResponse.de(repository.save(pedido));
     }
 
@@ -44,7 +43,7 @@ public class PedidoService {
             throw new TransicaoStatusInvalidaException(pedido.getStatus(), request.status());
         }
         List<ItemPedido> itens = converter(request.itens());
-        pedido.atualizar(itens, calcularTotal(itens), request.status());
+        pedido.atualizar(itens, Pedido.calcularTotal(itens), request.status());
         return PedidoResponse.de(repository.save(pedido));
     }
 
@@ -59,15 +58,7 @@ public class PedidoService {
         return repository.findById(id).orElseThrow(() -> new PedidoNaoEncontradoException(id));
     }
 
-    private List<ItemPedido> converter(List<ItemRequest> itens) {
-        return itens.stream()
-                .map(i -> new ItemPedido(i.produto(), i.quantidade(), i.precoUnitario()))
-                .toList();
-    }
-
-    private BigDecimal calcularTotal(List<ItemPedido> itens) {
-        return itens.stream()
-                .map(i -> i.precoUnitario().multiply(BigDecimal.valueOf(i.quantidade())))
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        private List<ItemPedido> converter(List<ItemRequest> itens) {
+        return itens.stream().map(ItemRequest::paraItem).toList();
     }
 }
