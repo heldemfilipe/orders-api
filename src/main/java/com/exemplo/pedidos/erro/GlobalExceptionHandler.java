@@ -3,16 +3,16 @@ package com.exemplo.pedidos.erro;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-import org.springframework.web.bind.MethodArgumentNotValidException;
-import org.springframework.web.context.request.WebRequest;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ProblemDetail;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.WebRequest;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
 
 @RestControllerAdvice
@@ -29,6 +29,14 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     public ProblemDetail transicaoInvalida(TransicaoStatusInvalidaException ex) {
         ProblemDetail problema = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
         problema.setTitle("Transição de status inválida");
+        return problema;
+    }
+
+    @ExceptionHandler(EventoNaoPublicadoException.class)
+    public ProblemDetail eventoNaoPublicado(EventoNaoPublicadoException ex) {
+        ProblemDetail problema = ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+                "Não foi possível enviar o pedido para processamento. Tente novamente.");
+        problema.setTitle("Fila indisponível");
         return problema;
     }
 

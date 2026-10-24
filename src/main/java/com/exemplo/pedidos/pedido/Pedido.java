@@ -32,6 +32,12 @@ public class Pedido {
         return new Pedido(null, clienteId, itens, total, StatusPedido.CRIADO, Instant.now());
     }
 
+    public static BigDecimal calcularTotal(List<ItemPedido> itens) {
+        return itens.stream()
+                .map(i -> i.precoUnitario().multiply(BigDecimal.valueOf(i.quantidade())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
     public void atualizar(List<ItemPedido> itens, BigDecimal total, StatusPedido status) {
         this.itens = List.copyOf(itens);
         this.total = total;
