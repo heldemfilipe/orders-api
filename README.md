@@ -2,7 +2,7 @@
 
 API REST de pedidos em Java com Spring Boot e MongoDB, construída como projeto de estudo em etapas: CRUD, testes e CI, Kafka, tratamento de falhas, circuit breaker e deploy.
 
-<!-- O badge do CI entra aqui na Etapa 2 -->
+[![CI](https://github.com/heldemfilipe/orders-api/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/heldemfilipe/orders-api/actions/workflows/ci.yml)
 
 ## O problema
 
@@ -22,26 +22,30 @@ Uma loja precisa registrar pedidos: quem comprou, o quê, quanto custa e em que 
 | Build | Maven com wrapper (`./mvnw`) |
 | Documentação da API | springdoc-openapi (Swagger UI) |
 | Execução local | Docker Compose |
+| Testes | JUnit 5, Mockito, AssertJ e Testcontainers |
+| CI | GitHub Actions, com imagem publicada no GHCR |
+| Container | Docker multi-stage (JRE Alpine, usuário não-root) |
 
 ## Como rodar
 
-Requisitos: JDK 25 e Docker.
+Requisitos: Docker (e JDK 25, só se for rodar sem container).
 
 ```bash
-docker compose up -d
+docker compose up -d --build
+```
+
+Sobe o MongoDB e a API (porta 8080). Para desenvolver com a API fora do container, suba só o banco e rode o Maven:
+
+```bash
+docker compose up -d mongo
 ./mvnw spring-boot:run
 ```
 
-O Compose sobe o MongoDB; a API roda na sua máquina, na porta 8080. A API dentro do Compose chega na Etapa 2.
-
-- Swagger UI: http://localhost:8080/swagger-ui/index.html
-- Saúde: http://localhost:8080/actuator/health
-
-No Windows, use `mvnw.cmd` no lugar de `./mvnw` se o terminal não reconhecer o script.
-
 ### Configuração
 
-A aplicação lê `MONGO_USER`, `MONGO_PASSWORD` e `MONGO_HOST` do ambiente. Sem nada configurado, valem os padrões de desenvolvimento (`pedidos` / `pedidos` / `localhost`). Veja `.env.example`.
+A aplicação lê `MONGO_USER`, `MONGO_PASSWORD` e `MONGO_HOST` do ambiente. Sem nada configurado, valem os padrões de desenvolvimento (`pedidos` / `pedidos` / `localhost`).
+
+Para trocar as credenciais, copie `.env.example` para `.env`. Quem lê esse arquivo é o Docker Compose, que usa os valores no MongoDB e os repassa à API como variáveis de ambiente. Rodando a API fora do container (`./mvnw spring-boot:run`), ela não lê o `.env`: exporte as variáveis no terminal.
 
 ### Parar
 
@@ -112,6 +116,14 @@ Todos os erros usam `application/problem+json` (RFC 9457).
 
 Um pedido `CRIADO` pode ser editado. Um `PAGO` só pode ser cancelado. Um `CANCELADO` não muda mais.
 
+## Testes
+
+```bash
+./mvnw verify
+```
+
+Os testes de integração usam Testcontainers e sobem um MongoDB descartável, então o Docker precisa estar rodando. Os testes de unidade (regras de status e cálculo do total) não precisam.
+
 ## Estrutura
 
 ```
@@ -141,7 +153,7 @@ src/main/java/com/exemplo/pedidos
 ## Roteiro
 
 - [x] Etapa 1: CRUD com MongoDB, validação e erros padronizados
-- [ ] Etapa 2: testes com Testcontainers e CI no GitHub Actions
+- [x] Etapa 2: testes com Testcontainers e CI no GitHub Actions
 - [ ] Etapa 3: Kafka, producer
 - [ ] Etapa 4: consumers e consumer groups
 - [ ] Etapa 5: retry, dead-letter e idempotência

@@ -17,5 +17,25 @@ services:
       retries: 5
       start_period: 10s
 
+  api:
+    build: .
+    container_name: pedidos-api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      MONGO_HOST: mongo
+      MONGO_USER: ${MONGO_USER:-pedidos}
+      MONGO_PASSWORD: ${MONGO_PASSWORD:-pedidos}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
 volumes:
   mongo-data:
