@@ -1,0 +1,9 @@
+# copie para terraform.tfvars (ignorado pelo git) e ajuste
+regiao             = "us-east-1"
+repositorio_github = "heldemfilipe/orders-api"
+
+# para estudo, restrinja ao seu IP: ["203.0.113.10/32"]
+cidrs_permitidos = ["0.0.0.0/0"]
+
+# defina false se a conta ja tiver o provedor OIDC do GitHub
+criar_provedor_oidc = true
