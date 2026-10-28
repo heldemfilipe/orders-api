@@ -23,7 +23,7 @@ import org.springframework.test.web.servlet.assertj.MockMvcTester;
 import org.testcontainers.kafka.KafkaContainer;
 
 import com.exemplo.pedidos.TestcontainersConfiguration;
-import com.exemplo.pedidos.kafka.KafkaTopicConfig;
+import com.exemplo.pedidos.adapter.kafka.KafkaTopicConfig;
 
 @SpringBootTest
 @AutoConfigureMockMvc

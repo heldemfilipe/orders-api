@@ -13,9 +13,16 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 
 import com.exemplo.pedidos.TestcontainersConfiguration;
+import com.exemplo.pedidos.application.Paginacao;
+import com.exemplo.pedidos.application.port.out.PedidoRepositoryPort;
+import com.exemplo.pedidos.domain.ItemPedido;
+import com.exemplo.pedidos.domain.Pedido;
+import com.exemplo.pedidos.domain.StatusPedido;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -26,11 +33,14 @@ class PedidoIntegracaoTest {
     MockMvcTester mvc;
 
     @Autowired
-    PedidoRepository repository;
+    PedidoRepositoryPort repository;
+
+    @Autowired
+    MongoTemplate mongo;
 
     @BeforeEach
     void limparBanco() {
-        repository.deleteAll();
+        mongo.remove(new Query(), "pedidos");
     }
 
         @Test
@@ -43,7 +53,7 @@ class PedidoIntegracaoTest {
                 .hasStatus(HttpStatus.CREATED)
                 .headers().containsHeader("Location");
 
-        List<Pedido> gravados = repository.findAll().stream()
+        List<Pedido> gravados = todos().stream()
                 .filter(p -> "cli-1".equals(p.getClienteId()))
                 .toList();
         assertThat(gravados).hasSize(1);
@@ -59,7 +69,7 @@ class PedidoIntegracaoTest {
                 .hasStatus(HttpStatus.BAD_REQUEST)
                 .hasContentType(MediaType.APPLICATION_PROBLEM_JSON);
 
-        assertThat(repository.findAll()).noneMatch(p -> p.getClienteId().isBlank());
+        assertThat(todos()).noneMatch(p -> p.getClienteId().isBlank());
     }
 
     @Test
@@ -70,7 +80,7 @@ class PedidoIntegracaoTest {
 
     @Test
     void putDeCanceladoParaPagoDevolve409EMantemStatus() {
-        Pedido cancelado = repository.save(new Pedido(null, "cli-1",
+        Pedido cancelado = repository.salvar(new Pedido(null, "cli-1",
                 List.of(new ItemPedido("caneta", 2, new BigDecimal("3.50"))),
                 new BigDecimal("7.00"), StatusPedido.CANCELADO, Instant.now()));
 
@@ -81,7 +91,11 @@ class PedidoIntegracaoTest {
                         """))
                 .hasStatus(HttpStatus.CONFLICT);
 
-        assertThat(repository.findById(cancelado.getId()).orElseThrow().getStatus())
+        assertThat(repository.buscarPorId(cancelado.getId()).orElseThrow().getStatus())
                 .isEqualTo(StatusPedido.CANCELADO);
+    }
+
+    private List<Pedido> todos() {
+        return repository.listar(new Paginacao(0, 1000, List.of())).conteudo();
     }
 }

@@ -23,11 +23,14 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 
 import com.exemplo.pedidos.TestcontainersConfiguration;
-import com.exemplo.pedidos.auditoria.AuditoriaEvento;
-import com.exemplo.pedidos.auditoria.AuditoriaEventoRepository;
-import com.exemplo.pedidos.pedido.Pedido;
-import com.exemplo.pedidos.pedido.PedidoRepository;
-import com.exemplo.pedidos.pedido.StatusPedido;
+import com.exemplo.pedidos.adapter.kafka.KafkaTopicConfig;
+import com.exemplo.pedidos.adapter.kafka.PedidoCriado;
+import com.exemplo.pedidos.adapter.out.mongo.AuditoriaEvento;
+import com.exemplo.pedidos.adapter.out.mongo.AuditoriaEventoRepository;
+import com.exemplo.pedidos.domain.Pedido;
+import com.exemplo.pedidos.application.Paginacao;
+import com.exemplo.pedidos.application.port.out.PedidoRepositoryPort;
+import com.exemplo.pedidos.domain.StatusPedido;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -43,7 +46,7 @@ class ConsumersIntegracaoTest {
     KafkaTemplate<String, PedidoCriado> kafkaTemplate;
 
     @Autowired
-    PedidoRepository pedidoRepository;
+    PedidoRepositoryPort pedidoRepository;
 
     @Autowired
     AuditoriaEventoRepository auditoriaRepository;
@@ -58,11 +61,11 @@ class ConsumersIntegracaoTest {
 
         kafkaTemplate.send(KafkaTopicConfig.PEDIDOS_CRIADOS, cliente, evento).get(10, TimeUnit.SECONDS);
         await().atMost(ESPERA_MAXIMA).untilAsserted(() ->
-                assertThat(pedidoRepository.findById(pedidoId)).isPresent());
+                assertThat(pedidoRepository.buscarPorId(pedidoId)).isPresent());
 
-        Pedido pedido = pedidoRepository.findById(pedidoId).orElseThrow();
-        pedido.atualizar(pedido.getItens(), pedido.getTotal(), StatusPedido.PAGO);
-        pedidoRepository.save(pedido);
+        Pedido pedido = pedidoRepository.buscarPorId(pedidoId).orElseThrow();
+        pedido.atualizar(pedido.getItens(), StatusPedido.PAGO);
+        pedidoRepository.salvar(pedido);
 
         // reentrega do mesmo evento, seguida de uma sentinela na mesma particao (mesma chave):
         // quando a sentinela aparece, a reentrega anterior ja foi processada
@@ -71,9 +74,9 @@ class ConsumersIntegracaoTest {
                 evento.itens(), evento.total(), Instant.now());
         kafkaTemplate.send(KafkaTopicConfig.PEDIDOS_CRIADOS, cliente, sentinela).get(10, TimeUnit.SECONDS);
         await().atMost(ESPERA_MAXIMA).untilAsserted(() ->
-                assertThat(pedidoRepository.findById(sentinela.pedidoId().toString())).isPresent());
+                assertThat(pedidoRepository.buscarPorId(sentinela.pedidoId().toString())).isPresent());
 
-        assertThat(pedidoRepository.findById(pedidoId).orElseThrow().getStatus()).isEqualTo(StatusPedido.PAGO);
+        assertThat(pedidoRepository.buscarPorId(pedidoId).orElseThrow().getStatus()).isEqualTo(StatusPedido.PAGO);
     }
 
     @Test
@@ -89,9 +92,9 @@ class ConsumersIntegracaoTest {
         String eventId = campo(corpo, "eventId");
 
         await().atMost(ESPERA_MAXIMA).untilAsserted(() ->
-                assertThat(pedidoRepository.findById(pedidoId)).isPresent());
+                assertThat(pedidoRepository.buscarPorId(pedidoId)).isPresent());
 
-        Pedido pedido = pedidoRepository.findById(pedidoId).orElseThrow();
+        Pedido pedido = pedidoRepository.buscarPorId(pedidoId).orElseThrow();
         assertThat(pedido.getClienteId()).isEqualTo("cli-consumer");
         assertThat(pedido.getStatus()).isEqualTo(StatusPedido.CRIADO);
         assertThat(pedido.getTotal()).isEqualByComparingTo("7.00");
@@ -121,7 +124,7 @@ class ConsumersIntegracaoTest {
         await().atMost(ESPERA_MAXIMA).untilAsserted(() ->
                 assertThat(auditoriasDo(eventId)).hasSize(2));
 
-        assertThat(pedidoRepository.findAll())
+        assertThat(pedidoRepository.listar(new Paginacao(0, 1000, List.of())).conteudo())
                 .filteredOn(p -> p.getId().equals(evento.pedidoId().toString()))
                 .hasSize(1);
     }

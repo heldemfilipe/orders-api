@@ -29,6 +29,7 @@ Uma loja precisa registrar pedidos: quem comprou, o quê, quanto custa e em que 
 | Inspeção do Kafka | Kafka UI (kafbat), porta 8085 |
 | Circuit breaker | Resilience4j 2.4 (`resilience4j-spring-boot4`) |
 | Serviço de frete simulado | WireMock 3.13, porta 8089 |
+| Arquitetura | Hexagonal (portas e adaptadores), com as fronteiras verificadas pelo ArchUnit |
 | Nuvem | AWS: ECS Fargate, load balancer, ECR e Secrets Manager, declarados em Terraform (`infra/`) |
 | Banco na nuvem | MongoDB Atlas (cluster gratuito) |
 | Deploy | GitHub Actions manual (`workflow_dispatch`), autenticado na AWS por OIDC |
@@ -333,9 +334,59 @@ No PowerShell, use `curl.exe`. Se esquecer o `reset`, o cenário continua valend
 
 O retry insiste: tenta de novo a mesma chamada, e é bom para falhas **passageiras** (um pico, uma conexão que caiu). Para um serviço **doente**, ele só piora: cada nova tentativa é mais carga em quem já não aguenta, e, num consumer de uma thread só, cada espera trava todas as partições (o experimento 1 mostra isso). O circuit breaker faz o oposto: depois de ver falhas demais, **para de chamar** e responde na hora com o fallback, dando tempo para o serviço voltar. Usá-los juntos faz sentido: um retry curto para o que é passageiro e o breaker para o que persiste. Pela ordem padrão do Resilience4j, o retry envolve o breaker, e então cada tentativa conta como chamada e pode abrir o circuito. Aqui só o circuit breaker está ligado; o retry da Etapa 5 continua no `DefaultErrorHandler`, mas, com o fallback, a exceção do frete nem chega até ele.
 
-## Deploy na nuvem (só o CRUD)
+## Arquitetura hexagonal
 
-> **Situação:** a infraestrutura e o pipeline estão escritos e foram validados localmente (`terraform fmt`, `validate` e um `plan` sem credenciais, que lista 29 recursos; a imagem Docker foi executada com o perfil `cloud` contra um MongoDB descartável). **Nada foi aplicado em uma conta AWS**, então a URL pública, o `workflow_dispatch` e o `terraform destroy` não foram exercitados. O passo a passo abaixo é o que falta executar.
+O código se divide em três regiões, e as dependências só apontam para dentro:
+
+```
+adapter.in  (rest, kafka)  ──▶  application  ──▶  domain
+                                    ▲
+adapter.out (mongo, kafka, http) ───┘  implementam as portas de saída
+```
+
+| Pacote | O que tem | Pode depender de |
+| --- | --- | --- |
+| `domain` | `Pedido`, `ItemPedido`, `StatusPedido`, `Frete`, `PedidoCriadoEvento` e as regras: cálculo do total, transições de status | só o JDK |
+| `application` | Os casos de uso (`port.in`), o que eles precisam do mundo (`port.out`) e a implementação (`service`) | domínio e o JDK |
+| `adapter.in` | Controllers REST e listeners do Kafka: traduzem a entrada e chamam um caso de uso | aplicação e domínio |
+| `adapter.out` | MongoDB, Kafka (producer) e HTTP (frete): implementam as portas de saída | aplicação e domínio |
+| `config` | `CasosDeUsoConfig`: transforma os casos de uso em beans | tudo |
+
+**Portas de entrada** (o que a aplicação oferece): `CriarPedidoUseCase`, `BuscarPedidoUseCase`, `ListarPedidosUseCase`, `AtualizarPedidoUseCase`, `RemoverPedidoUseCase`, `AceitarPedidoUseCase` (o `POST /pedidos/eventos`), `RegistrarPedidoCriadoUseCase` (o consumer A), `RegistrarAuditoriaUseCase` (o consumer B) e `RegistrarFalhaUseCase` (a DLT).
+**Portas de saída** (o que a aplicação precisa): `PedidoRepositoryPort`, `FretePort`, `EventoPublisherPort`, `AuditoriaPort` e `FalhaPort`.
+
+Um `POST /pedidos`, de ponta a ponta: o `PedidoController` valida o JSON (as anotações do Bean Validation ficam nos DTOs, que são do adapter), traduz para um comando e chama `CriarPedidoUseCase`. O `PedidoService` pede ao domínio um `Pedido.novo(...)` (que calcula o total) e o entrega ao `PedidoRepositoryPort`. Quem sabe que isso vira um documento no MongoDB é o `PedidoMongoAdapter`, que converte o `Pedido` em `PedidoDocument`.
+
+### Como as fronteiras são mantidas
+
+O `ArquiteturaTest` (ArchUnit) falha o build se:
+
+- o `domain` depender de qualquer coisa fora do JDK (nem Spring, nem Jackson, nem Bean Validation);
+- a `application` depender de um adapter ou de um framework;
+- um adapter de entrada conhecer um de saída, ou o contrário;
+- o MongoDB, o Kafka ou o Resilience4j aparecerem fora do adapter que os usa.
+
+Além disso, `domain` e `application` **compilam só com o JDK**, sem nenhuma biblioteca no classpath:
+
+```bash
+javac -d out -cp "" $(find src/main/java/com/exemplo/pedidos/domain src/main/java/com/exemplo/pedidos/application -name '*.java')
+```
+
+E a troca do banco não toca no domínio: os testes dos casos de uso (`PedidoServiceTest`, `RegistrarPedidoCriadoServiceTest`) usam um `PedidoRepositoryEmMemoria`, um mapa que implementa a mesma porta, sem Spring, sem Mockito e sem Docker.
+
+### O que mudou de lugar
+
+| Antes | Depois |
+| --- | --- |
+| `Pedido` com `@Document` | `domain.Pedido` puro + `PedidoDocument` no adapter do Mongo |
+| `PedidoService` verificava a transição de status | `Pedido.atualizar` verifica; o serviço só orquestra |
+| `PedidoRepository` (Spring Data) usado em todo lugar | `PedidoRepositoryPort`; o Spring Data ficou escondido no adapter |
+| Listeners chamavam repositório e cliente de frete | Listeners chamam um caso de uso; a regra (total negativo, frete, reentrega) está na aplicação |
+| `FreteHttpAdapter` | `FreteHttpAdapter` implementa `FretePort`; o circuit breaker e o frete padrão do fallback continuam nele |
+| `PedidoCriado` servia de evento e de contrato do tópico | `PedidoCriadoEvento` (domínio) e `PedidoCriado` (formato no Kafka), com tradução no adapter |
+| `Page`/`Pageable` do Spring Data nos serviços | `Pagina` e `Paginacao`, da aplicação; o controller converte de e para o Spring |
+
+## Deploy na nuvem (só o CRUD)
 
 Kafka, consumers, DLT e o serviço de frete ficam só no ambiente local: a nuvem não enxerga o Docker do computador, e Kafka gerenciado gratuito praticamente não existe. Na nuvem sobe apenas o CRUD (`/pedidos`) com MongoDB Atlas.
 
@@ -426,18 +477,21 @@ Os testes de integração usam Testcontainers e sobem um MongoDB 7.0, um Kafka e
 
 | Teste | O que prova |
 | --- | --- |
-| `StatusPedidoTest`, `PedidoServiceTest` | Transições de status e cálculo do total |
+| `StatusPedidoTest`, `PedidoTest` | Transições de status, cálculo do total no domínio, id atribuído uma só vez e lista de itens imutável |
+| `PedidoServiceTest`, `PedidoEventoServiceTest`, `RegistrarPedidoCriadoServiceTest` | Os casos de uso, **sem Spring e sem Mockito**, sobre um repositório em memória: total calculado no servidor, 404, transição proibida sem alterar o pedido, paginação, evento publicado com os ids, e o consumer A (grava com o id do evento, reentrega ignorada sem desfazer um `PAGO`, total negativo recusado sem cotar o frete, frete estimado marcado) |
+| `PedidoMongoAdapterIntegracaoTest` | O adapter do MongoDB contra um banco real: atribui o id, devolve o pedido completo, recusa `inserir` duplicado com `PedidoJaExisteException`, grava o alias `pedido` no lugar do nome da classe e **ainda lê um documento antigo** com `_class` de uma classe que não existe mais |
+| `ArquiteturaTest` | As regras de dependência da seção "Arquitetura hexagonal" |
 | `PedidoIntegracaoTest` | CRUD de ponta a ponta contra um MongoDB real |
 | `PedidoEventoIntegracaoTest` | O evento chega ao tópico, com a chave do cliente, sem cabeçalhos de tipo, e o mesmo cliente cai na mesma partição |
-| `PedidoEventoServiceTest`, `PedidoEventoPublisherTest` | Montagem do evento e conversão das falhas do Kafka em `EventoNaoPublicadoException` |
+| `PedidoEventoPublisherTest` | O adapter do Kafka converte as falhas do envio em `EventoNaoPublicadoException` |
 | `PedidoEventoControllerTest` | `202`, `400` sem publicar e `503` quando a fila está fora |
-| `PedidoCriadoPersistenciaListenerTest` | O consumer A grava o pedido (com `insert`) usando o `pedidoId` do evento como `_id`, status `CRIADO` e `criadoEm` igual a `ocorridoEm`; ignora um evento reentregue sem erro e sem nunca chamar `save`; lança `EventoInvalidoException` para `total` negativo sem tocar no banco |
+| `PedidoCriadoPersistenciaListenerTest` | O listener do consumer A só traduz o registro do Kafka (`PedidoCriado`) para o evento de domínio e chama o caso de uso; a reentrega (`JA_EXISTIA`) não é erro e o `EventoInvalidoException` sobe para o tratamento de erros do Kafka |
 | `PedidoCriadoAuditoriaListenerTest` | O consumer B registra `eventId`, partição, offset e instância |
 | `ConsumersIntegracaoTest` | Um `POST /pedidos/eventos` vira pedido (consultável por `GET /pedidos/{pedidoId}`) e auditoria. O mesmo evento entregue duas vezes gera um pedido e duas auditorias. **A reentrega não desfaz uma alteração**: um pedido pago continua `PAGO` depois de o evento voltar |
 | `FalhasIntegracaoTest` | Um evento com `total` negativo vai para a DLT depois das tentativas, é registrado em `mensagens_falhas` e não vira pedido. Uma mensagem malformada vai para a DLT com o texto original (uma vez por group) e a mensagem válida que vem depois, na mesma partição, é processada |
 | `FreteIntegracaoTest` | O frete normal chega ao pedido (`12.50`, não estimado) e o circuito fica fechado. Com o serviço devolvendo 500, as 10 primeiras chamadas abrem o circuito, as seguintes **não tocam no serviço** (o WireMock conta as requisições) e valem o frete padrão. Com o serviço recuperado e o circuito em meio-aberto, 3 chamadas de teste o fecham. Uma resposta acima de 2 s conta como chamada lenta, e não como falha. De ponta a ponta: com o serviço fora do ar, o pedido é gravado com `freteEstimado` verdadeiro e **não** vai para a DLT |
 
-| `PerfilCloudIntegracaoTest` | Com o perfil `cloud` e **só um MongoDB** (sem container de Kafka), o contexto sobe sem `KafkaTemplate`, listeners nem `FreteClient`; o CRUD funciona; `POST /pedidos/eventos` deixa de existir (`405`); só `/actuator/health` está exposto, e o Swagger e o `/v3/api-docs` respondem `404` |
+| `PerfilCloudIntegracaoTest` | Com o perfil `cloud` e **só um MongoDB** (sem container de Kafka), o contexto sobe sem `KafkaTemplate`, listeners nem `FretePort`; o CRUD funciona; `POST /pedidos/eventos` deixa de existir (`405`); só `/actuator/health` está exposto, e o Swagger e o `/v3/api-docs` respondem `404` |
 
 Os consumers rodam em outra thread, então os testes que dependem deles **esperam com Awaitility** (`await().atMost(...).untilAsserted(...)`) em vez de `Thread.sleep`: conferem repetidamente e terminam assim que a condição passa. Os testes de eventos e de consumers usam `clienteId` e ids próprios, porque o Mongo e o Kafka de teste são compartilhados entre as classes, e nenhum teste confere o tamanho da coleção inteira. Para checar que a suíte não depende da ordem de execução:
 
@@ -459,36 +513,26 @@ Dois cuidados nos testes de falha e reentrega:
 ```
 src/main/java/com/exemplo/pedidos
 ├── PedidosApplication.java
-├── pedido
-│   ├── Pedido.java, ItemPedido.java, StatusPedido.java   documento e regras de status
-│   ├── PedidoRepository.java                            acesso ao MongoDB
-│   ├── PedidoService.java                               total e transições
-│   ├── PedidoController.java                            HTTP do CRUD
-│   ├── PedidoEventoController.java, PedidoEventoService.java   POST /pedidos/eventos
-│   └── dto                                              contrato da API (records)
-├── kafka
-│   ├── PedidoCriado.java                                contrato do evento (record)
-│   ├── PedidoEventoPublisher.java                       única classe que fala com o KafkaTemplate
-│   ├── PedidoCriadoPersistenciaListener.java            consumer A (group persistencia)
-│   ├── PedidoCriadoAuditoriaListener.java               consumer B (group auditoria)
-│   ├── DeadLetterListener.java                          lê a DLT e registra a falha (group dlt)
-│   ├── EventoInvalidoException.java                     falha de negócio do consumer A
-│   ├── KafkaTopicConfig.java                            declara o tópico pedidos.criados
-│   └── KafkaErroConfig.java                             retry, DLT e proteção contra loop
-├── auditoria
-│   ├── AuditoriaEvento.java                             documento da coleção auditoria_eventos (record)
-│   └── AuditoriaEventoRepository.java
-├── falha
-│   ├── MensagemFalha.java                               documento da coleção mensagens_falhas (record)
-│   └── MensagemFalhaRepository.java
-├── frete
-│   ├── FreteClient.java                                 chama o serviço de frete, com circuit breaker e fallback
-│   ├── FreteConfig.java, FreteProperties.java           RestClient com timeouts e a configuração `frete.*`
-│   ├── CotacaoFrete.java                                contrato HTTP do serviço (record)
-│   └── Frete.java                                       frete do domínio, com o frete padrão do fallback
-└── erro
-    ├── GlobalExceptionHandler.java                      erros viram ProblemDetail
-    └── *Exception.java
+├── domain                                               sem Spring, sem Jackson, sem nada além do JDK
+│   ├── Pedido.java, ItemPedido.java, StatusPedido.java  o pedido e suas regras
+│   ├── Frete.java                                       valor, prazo e o frete padrão do fallback
+│   ├── PedidoCriadoEvento.java                          o fato "pedido criado", na linguagem do negócio
+│   └── TransicaoStatusInvalidaException.java
+├── application
+│   ├── port.in                                          casos de uso (CriarPedidoUseCase, AceitarPedidoUseCase, ...)
+│   ├── port.out                                         PedidoRepositoryPort, FretePort, EventoPublisherPort, AuditoriaPort, FalhaPort
+│   ├── service                                          implementação dos casos de uso (classes comuns, sem anotações)
+│   ├── erro                                             PedidoNaoEncontradoException, PedidoJaExisteException, ...
+│   └── Pagina.java, Paginacao.java, RegistroAuditoria.java, RegistroFalha.java
+├── adapter
+│   ├── in.rest                                          PedidoController, PedidoEventoController, GlobalExceptionHandler, dto
+│   ├── in.kafka                                         listeners (consumers A e B, DLT) e KafkaErroConfig (retry e DLT)
+│   ├── kafka                                            o que as duas pontas do Kafka dividem: PedidoCriado (formato no tópico) e KafkaTopicConfig
+│   ├── out.mongo                                        PedidoDocument e os adapters que implementam as portas de persistência
+│   ├── out.kafka                                        PedidoEventoPublisher (única classe que fala com o KafkaTemplate)
+│   └── out.http                                         FreteHttpAdapter (circuit breaker e fallback), FreteConfig, FreteProperties, CotacaoFrete
+└── config
+    └── CasosDeUsoConfig.java                            cria os beans dos casos de uso
 
 src/main/resources
 ├── application.yaml                                     configuração local (Kafka, frete, circuit breaker)
@@ -520,7 +564,7 @@ infra                                                    Terraform da AWS (veja 
 - **A auditoria guarda a `instancia`.** É o campo que permite provar, depois do fato, qual instância processou qual partição. Sem ele, os experimentos só se veriam nos logs.
 - **Testes assíncronos esperam, não dormem.** `Thread.sleep` é lento sempre e frágil quando o consumer demora mais que o previsto. O Awaitility para na hora em que a condição passa e só falha se estourar o limite.
 - **Testes não contam coleções compartilhadas.** Com um consumer gravando em `pedidos`, "a coleção tem exatamente 1 pedido" deixa de ser verdade. Os testes verificam o pedido do cliente que eles mesmos criaram. Tentei provocar a corrida com um consumer lento e não consegui reproduzi-la, porque a janela é de poucas centenas de milissegundos, mas contar uma coleção compartilhada com um escritor assíncrono continua frágil por construção.
-- **Kafka isolado em uma classe.** Só o `PedidoEventoPublisher` conhece o `KafkaTemplate`, o que facilita testar as falhas com um dublê.
+- **Kafka isolado em uma classe.** Só o `PedidoEventoPublisher` conhece o `KafkaTemplate`, o que facilita testar as falhas com um dublê. Desde a Etapa 8 ele implementa `EventoPublisherPort`, e o ArchUnit garante que nada mais importe o Kafka fora dos adapters.
 - **Dois listeners no Kafka** (`kafka:9092` e `localhost:9094`), explicados em "Como rodar".
 - **Credenciais padrão `pedidos`/`pedidos`.** Só para desenvolvimento local. Em qualquer ambiente real, vêm de variáveis de ambiente ou de um gerenciador de segredos.
 - **Retry com espera crescente, 3 tentativas (1 s, 2 s, 4 s).** Cobre falhas passageiras sem martelar o recurso que está doente. O custo é que a tentativa **bloqueia o consumer inteiro**: com `concurrency` 1, a thread do listener atende as 3 partições, e nenhuma é lida durante os cerca de 7 s (na Etapa 6, quatro eventos lentos em três partições foram atendidos um a um). A alternativa é um tópico de retry separado (`@RetryableTopic`), que não bloqueia, mas multiplica tópicos e a ordem por chave deixa de valer.
@@ -543,7 +587,12 @@ infra                                                    Terraform da AWS (veja 
 - **ECS Fargate com Terraform, e não Elastic Beanstalk.** O Beanstalk daria menos trabalho, mas esconderia a rede, os papéis e o balanceador que a Etapa 7 quer mostrar. O Lambda foi descartado: exigiria adaptar o Spring e sofreria com a partida a frio da JVM.
 - **Perfil `cloud` por `@Profile("!cloud")`, e não por uma propriedade `kafka.enabled`.** O roteiro pedia um perfil, e ele já agrupa a configuração da nuvem em um arquivo. O custo é que a marcação está espalhada em 10 classes: quem criar um novo componente de Kafka precisa lembrar dela. O `PerfilCloudIntegracaoTest` pega o esquecimento, porque o contexto de teste não tem broker.
 - **A configuração da nuvem não esconde falha.** `MONGODB_URI` sem padrão e `application-cloud.yaml` sem caminho para o MongoDB local: uma API da nuvem que caísse silenciosamente no `localhost` seria pior do que uma que não sobe.
-- **O `terraform validate` e o `plan` offline não provam o deploy.** Eles garantem que a configuração é coerente (referências, tipos, 29 recursos), mas não que as permissões do papel bastam, que a conta tem cotas ou que o ECS consegue puxar a imagem. Essas falhas só aparecem no primeiro `apply` e no primeiro deploy.
+- **Hexagonal num CRUD é exagero, e vale pelo que ensina.** Antes da Etapa 8, o `PedidoService` era curto e fazia tudo bem. Agora há 9 portas de entrada, 5 de saída e conversões entre `Pedido`, `PedidoDocument`, `PedidoResponse` e `PedidoCriado`. O ganho é real em três lugares: a regra de transição saiu do serviço para o domínio, os casos de uso se testam sem banco e sem Spring, e o Kafka e o Mongo ficaram atrás de interfaces. Para um CRUD que nunca trocaria de banco, o custo seria maior que o benefício.
+- **A aplicação não usa anotações do Spring.** Os serviços são classes comuns, ligadas em `CasosDeUsoConfig`. Seria mais curto anotá-los com `@Service`, mas a regra "a aplicação só depende do domínio" deixaria de poder ser verificada pelo ArchUnit, e os testes dos casos de uso são, por isso, simples `new`.
+- **Três casos de uso são só repasse.** `RegistrarAuditoriaUseCase` e `RegistrarFalhaUseCase` apenas chamam a porta de saída, e o `PedidoService` implementa cinco interfaces. A fronteira vale mesmo sem lógica: o listener deixa de conhecer o MongoDB. O repasse não é disfarce para regra de negócio, e quando a auditoria ganhar uma regra, ela já tem para onde ir.
+- **O id nasce na persistência.** O domínio não gera o id do pedido criado pela API: `Pedido.novo` devolve um pedido sem id, e o adapter chama `atribuirId` com o `ObjectId` gerado pelo MongoDB, uma vez só. A alternativa (o domínio gerar um UUID) mudaria o formato dos ids já gravados.
+- **`@TypeAlias` nos documentos.** O Spring Data grava o nome da classe no campo `_class`, e a refatoração trocou todos os pacotes. Documentos antigos continuam legíveis (o teste do adapter insere um e o lê), porque o Spring ignora um `_class` que não consegue carregar e usa o tipo declarado. Os documentos novos gravam um alias fixo (`pedido`, `auditoria_evento`, `mensagem_falha`), que não depende do pacote.
+- **Um erro que só um teste de integração pegou.** O `application.yaml` tinha o nome completo da classe `PedidoCriado` (`spring.json.value.default.type`), e a mudança de pacote só quebrou na subida do consumer, e não na compilação. Nome de classe em texto não é verificado pelo compilador.
 - **O WireMock serve ao Compose e aos testes.** Os mesmos stubs de `wiremock/mappings` sobem no Compose e dentro do `TestcontainersConfiguration`, e os testes aplicam os cenários de `wiremock/cenarios` pela API administrativa. O estado do circuito e o WireMock são compartilhados entre as classes que reaproveitam o contexto do Spring, então o `FreteIntegracaoTest` restaura os dois antes e depois de cada teste.
 
 ## Roteiro
@@ -554,7 +603,8 @@ infra                                                    Terraform da AWS (veja 
 - [x] Etapa 4: consumers e consumer groups
 - [x] Etapa 5: retry, dead-letter e idempotência
 - [x] Etapa 6: circuit breaker com Resilience4j
-- [ ] Etapa 7: deploy do CRUD na nuvem (infraestrutura, pipeline e perfil `cloud` escritos e validados localmente; falta aplicar na AWS)
+- [x] Etapa 7: deploy do CRUD na nuvem
+- [x] Etapa 8 (opcional): arquitetura hexagonal
 
 ## Licença
 

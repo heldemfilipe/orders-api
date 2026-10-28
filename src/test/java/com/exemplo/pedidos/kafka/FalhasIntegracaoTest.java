@@ -25,9 +25,11 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.testcontainers.kafka.KafkaContainer;
 
 import com.exemplo.pedidos.TestcontainersConfiguration;
-import com.exemplo.pedidos.falha.MensagemFalha;
-import com.exemplo.pedidos.falha.MensagemFalhaRepository;
-import com.exemplo.pedidos.pedido.PedidoRepository;
+import com.exemplo.pedidos.adapter.kafka.KafkaTopicConfig;
+import com.exemplo.pedidos.adapter.kafka.PedidoCriado;
+import com.exemplo.pedidos.adapter.out.mongo.MensagemFalha;
+import com.exemplo.pedidos.adapter.out.mongo.MensagemFalhaRepository;
+import com.exemplo.pedidos.application.port.out.PedidoRepositoryPort;
 
 // mesmas anotacoes do ConsumersIntegracaoTest: o Spring reaproveita o contexto (e os containers)
 @SpringBootTest
@@ -45,7 +47,7 @@ class FalhasIntegracaoTest {
     KafkaContainer kafka;
 
     @Autowired
-    PedidoRepository pedidoRepository;
+    PedidoRepositoryPort pedidoRepository;
 
     @Autowired
     MensagemFalhaRepository falhaRepository;
@@ -67,7 +69,7 @@ class FalhasIntegracaoTest {
         assertThat(falha.motivo()).contains("total negativo");
         assertThat(falha.payload()).contains(evento.pedidoId().toString());
 
-        assertThat(pedidoRepository.findById(evento.pedidoId().toString())).isEmpty();
+        assertThat(pedidoRepository.buscarPorId(evento.pedidoId().toString())).isEmpty();
     }
 
     @Test
@@ -81,7 +83,7 @@ class FalhasIntegracaoTest {
 
         // a mensagem valida, na mesma particao e depois do veneno, nao fica presa atras dele
         await().atMost(ESPERA_MAXIMA).untilAsserted(() ->
-                assertThat(pedidoRepository.findById(valido.pedidoId().toString())).isPresent());
+                assertThat(pedidoRepository.buscarPorId(valido.pedidoId().toString())).isPresent());
 
         // os dois groups (persistencia e auditoria) falham ao ler o mesmo veneno
         await().atMost(ESPERA_MAXIMA).untilAsserted(() ->
