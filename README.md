@@ -34,6 +34,44 @@ Uma loja precisa registrar pedidos: quem comprou, o quê, quanto custa e em que 
 | Banco na nuvem | MongoDB Atlas (cluster gratuito) |
 | Deploy | GitHub Actions manual (`workflow_dispatch`), autenticado na AWS por OIDC |
 
+## Visão geral
+
+O mesmo pedido pode entrar por dois caminhos: direto no MongoDB (`POST /pedidos`) ou como evento (`POST /pedidos/eventos`), que passa pelo Kafka e é consumido por dois groups independentes. Falhas vão para a dead-letter queue, e o frete é consultado por um serviço externo protegido por circuit breaker.
+
+```mermaid
+flowchart LR
+    cliente([Cliente HTTP])
+
+    subgraph api[API de pedidos - Spring Boot]
+        crud["POST/GET/PUT/DELETE /pedidos"]
+        evento["POST /pedidos/eventos"]
+        a["Consumer A<br/>group persistencia"]
+        b["Consumer B<br/>group auditoria"]
+        dlt["Listener da DLT<br/>group dlt"]
+    end
+
+    kafka[("Kafka<br/>pedidos.criados<br/>3 partições")]
+    dlq[("Kafka<br/>pedidos.criados.DLT")]
+    frete["Serviço de frete<br/>WireMock<br/>circuit breaker + timeouts"]
+
+    subgraph mongo[MongoDB]
+        pedidos[(pedidos)]
+        auditoria[(auditoria_eventos)]
+        falhas[(mensagens_falhas)]
+    end
+
+    cliente --> crud --> pedidos
+    cliente --> evento --> kafka
+    kafka --> a --> pedidos
+    a -. cotação .-> frete
+    kafka --> b --> auditoria
+    a -. "falha após 3 tentativas" .-> dlq
+    b -. "falha após 3 tentativas" .-> dlq
+    dlq --> dlt --> falhas
+```
+
+Na nuvem sobe só o `POST/GET/PUT/DELETE /pedidos`, com o MongoDB Atlas (veja "Deploy na nuvem"). O código está organizado em portas e adaptadores (veja "Arquitetura hexagonal").
+
 ## Como rodar
 
 Requisitos: Docker (e JDK 25, só se for rodar sem container).
