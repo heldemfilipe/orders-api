@@ -124,7 +124,7 @@ O `pedidoId` é o id que o pedido terá quando for gravado. Para ver a mensagem 
 docker exec pedidos-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic pedidos.criados --from-beginning --formatter-property print.key=true --formatter-property print.partition=true
 ```
 
-Mensagens do mesmo `clienteId` aparecem sempre na mesma partição. Quem grava o pedido no banco a partir desse evento é o consumer, que ainda não existe (Etapa 4).
+Mensagens do mesmo `clienteId` aparecem sempre na mesma partição. Quem grava o pedido no banco a partir desse evento é o consumer A (veja "Consumers e consumer groups"): depois do `202`, o pedido fica disponível em `GET /pedidos/{pedidoId}` assim que ele o grava.
 
 ### Erros
 
@@ -157,6 +157,55 @@ Todos os erros usam `application/problem+json` (RFC 9457).
 
 Um pedido `CRIADO` pode ser editado. Um `PAGO` só pode ser cancelado. Um `CANCELADO` não muda mais.
 
+## Consumers e consumer groups
+
+O tópico `pedidos.criados` é lido por dois consumers, cada um no seu group:
+
+| Consumer | Group | O que faz |
+| --- | --- | --- |
+| A, `PedidoCriadoPersistenciaListener` | `persistencia` | Grava o `Pedido` no MongoDB, usando o `pedidoId` do evento como `_id` |
+| B, `PedidoCriadoAuditoriaListener` | `auditoria` | Grava em `auditoria_eventos` o `eventId`, a partição, o offset, o horário e a instância que processou |
+
+Dentro de um group, cada partição é lida por **um** membro por vez. Groups diferentes são independentes: cada um recebe **todas** as mensagens. Com `auto-offset-reset: earliest`, um group novo começa do início do tópico, em vez de ignorar o que já foi publicado.
+
+Cada instância da aplicação roda os dois listeners, então duas instâncias formam dois membros em cada group.
+
+### Experimentos
+
+Cada experimento foi montado com instâncias da aplicação em portas diferentes, todas no mesmo Mongo e no mesmo Kafka. A coluna "observado" é o que de fato aconteceu na minha máquina.
+
+| # | Experimento | Como montar | Resultado esperado | Resultado observado | Por quê |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Mesmo group, 2 instâncias | 2 instâncias, 9 pedidos de clientes diferentes | As 3 partições se dividem entre elas e cada mensagem é processada por uma só | _(preencher)_ | _(preencher)_ |
+| 2 | Groups diferentes | Olhar `persistencia` e `auditoria` ao mesmo tempo | Os dois recebem todas as mensagens | _(preencher)_ | _(preencher)_ |
+| 3 | Mais instâncias que partições | 4 instâncias no mesmo group, com 3 partições | Uma instância fica sem partição e ociosa | _(preencher)_ | _(preencher)_ |
+| 4 | Rebalanceamento | Derrubar uma instância com mensagens fluindo (desligamento limpo e à força) | As partições dela migram para as demais, visível nos logs | _(preencher)_ | _(preencher)_ |
+| 5 | Ordem | Várias mensagens do mesmo `clienteId` | Mesma partição, processadas na ordem de envio | _(preencher)_ | _(preencher)_ |
+
+### Como reproduzir
+
+```bash
+./mvnw -DskipTests clean package
+java -jar target/orders-api-0.0.1-SNAPSHOT.jar --server.port=8091
+```
+
+Uma instância por terminal, mudando só a porta. A API do Compose precisa estar parada (`docker compose stop api`), senão ela entra nos groups. Use um prefixo de `clienteId` novo em cada experimento.
+
+Estado dos groups (partições, offsets, lag e dono de cada partição) e dos membros (a coluna `#PARTITIONS` mostra quem está ocioso):
+
+```bash
+docker exec pedidos-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group persistencia
+docker exec pedidos-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group persistencia --members --verbose
+```
+
+Quem processou o quê, pela auditoria (troque o prefixo do cliente):
+
+```bash
+docker exec pedidos-mongo mongosh -u pedidos -p pedidos --authenticationDatabase admin pedidos --quiet --eval "db.auditoria_eventos.find({clienteId: /^exp1-/}, {_id: 0, clienteId: 1, particao: 1, offset: 1, instancia: 1}).sort({particao: 1, offset: 1}).forEach(d => print(d.clienteId, d.particao, Number(d.offset), d.instancia))"
+```
+
+Nos logs de cada instância, as linhas `persistencia: partitions assigned: [...]` e `partitions revoked: [...]` mostram quais partições ela recebeu e perdeu.
+
 ## Testes
 
 ```bash
@@ -188,7 +237,12 @@ src/main/java/com/exemplo/pedidos
 ├── kafka
 │   ├── PedidoCriado.java                                contrato do evento (record)
 │   ├── PedidoEventoPublisher.java                       única classe que fala com o KafkaTemplate
+│   ├── PedidoCriadoPersistenciaListener.java            consumer A (group persistencia)
+│   ├── PedidoCriadoAuditoriaListener.java               consumer B (group auditoria)
 │   └── KafkaTopicConfig.java                            declara o tópico pedidos.criados
+├── auditoria
+│   ├── AuditoriaEvento.java                             documento da coleção auditoria_eventos (record)
+│   └── AuditoriaEventoRepository.java
 └── erro
     ├── GlobalExceptionHandler.java                      erros viram ProblemDetail
     └── *Exception.java
