@@ -14,7 +14,7 @@ import com.exemplo.pedidos.pedido.ItemPedido;
 import com.exemplo.pedidos.pedido.Pedido;
 import com.exemplo.pedidos.pedido.PedidoRepository;
 import com.exemplo.pedidos.pedido.StatusPedido;
-import com.exemplo.pedidos.frete.CotacaoFrete;
+import com.exemplo.pedidos.frete.Frete;
 import com.exemplo.pedidos.frete.FreteClient;
 
 @Component
@@ -45,8 +45,8 @@ public class PedidoCriadoPersistenciaListener {
 
         Pedido pedido = new Pedido(evento.pedidoId().toString(), evento.clienteId(), itens,
                 evento.total(), StatusPedido.CRIADO, evento.ocorridoEm());
-        CotacaoFrete cotacao = freteClient.cotar(evento.clienteId());
-        pedido.definirFrete(cotacao.valor(), false);
+        Frete frete = freteClient.cotar(evento.clienteId());
+        pedido.definirFrete(frete.valor(), frete.estimado());
         try {
             repository.insert(pedido);
         } catch (DuplicateKeyException e) {

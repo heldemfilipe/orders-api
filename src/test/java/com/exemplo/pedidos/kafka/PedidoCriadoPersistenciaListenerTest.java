@@ -25,7 +25,7 @@ import org.springframework.dao.DuplicateKeyException;
 import com.exemplo.pedidos.pedido.Pedido;
 import com.exemplo.pedidos.pedido.PedidoRepository;
 import com.exemplo.pedidos.pedido.StatusPedido;
-import com.exemplo.pedidos.frete.CotacaoFrete;
+import com.exemplo.pedidos.frete.Frete;
 import com.exemplo.pedidos.frete.FreteClient;
 
 @ExtendWith(MockitoExtension.class)
@@ -37,7 +37,7 @@ class PedidoCriadoPersistenciaListenerTest {
 
     @Test
     void gravaPedidoComIdDoEventoEStatusCriado() {
-        when(freteClient.cotar("cli-1")).thenReturn(new CotacaoFrete(new BigDecimal("12.50"), 3));
+        when(freteClient.cotar("cli-1")).thenReturn(new Frete(new BigDecimal("12.50"), 3, false));
         PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, freteClient, "8091");
         PedidoCriado evento = evento(new BigDecimal("7.00"));
 
@@ -59,7 +59,7 @@ class PedidoCriadoPersistenciaListenerTest {
 
     @Test
     void eventoReentregueEIgnoradoSemErroENuncaSubstituiOPedido() {
-        when(freteClient.cotar("cli-1")).thenReturn(new CotacaoFrete(new BigDecimal("12.50"), 3));
+        when(freteClient.cotar("cli-1")).thenReturn(new Frete(new BigDecimal("12.50"), 3, false));
         PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, freteClient, "8091");
         when(repository.insert(any(Pedido.class))).thenThrow(new DuplicateKeyException("_id duplicado"));
 

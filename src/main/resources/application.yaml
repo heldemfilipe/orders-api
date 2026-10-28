@@ -26,3 +26,23 @@ frete:
   url: ${FRETE_URL:http://localhost:8089}
   timeout-conexao: 1s
   timeout-leitura: 3s
+resilience4j:
+  circuitbreaker:
+    instances:
+      frete:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,circuitbreakers,circuitbreakerevents
