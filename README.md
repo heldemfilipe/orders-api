@@ -124,7 +124,7 @@ O `pedidoId` é o id que o pedido terá quando for gravado. Para ver a mensagem 
 docker exec pedidos-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic pedidos.criados --from-beginning --formatter-property print.key=true --formatter-property print.partition=true
 ```
 
-Mensagens do mesmo `clienteId` aparecem sempre na mesma partição. Quem grava o pedido no banco a partir desse evento é o consumer, que ainda não existe (Etapa 4).
+Mensagens do mesmo `clienteId` aparecem sempre na mesma partição. Quem grava o pedido no banco a partir desse evento é o consumer A (veja "Consumers e consumer groups"): depois do `202`, o pedido fica disponível em `GET /pedidos/{pedidoId}` assim que ele o grava.
 
 ### Erros
 
@@ -157,6 +157,57 @@ Todos os erros usam `application/problem+json` (RFC 9457).
 
 Um pedido `CRIADO` pode ser editado. Um `PAGO` só pode ser cancelado. Um `CANCELADO` não muda mais.
 
+## Consumers e consumer groups
+
+O tópico `pedidos.criados` é lido por dois consumers, cada um no seu group:
+
+| Consumer | Group | O que faz |
+| --- | --- | --- |
+| A, `PedidoCriadoPersistenciaListener` | `persistencia` | Grava o `Pedido` no MongoDB, usando o `pedidoId` do evento como `_id` |
+| B, `PedidoCriadoAuditoriaListener` | `auditoria` | Grava em `auditoria_eventos` o `eventId`, a partição, o offset, o horário e a instância que processou |
+
+Dentro de um group, cada partição é lida por **um** membro por vez. Groups diferentes são independentes: cada um recebe **todas** as mensagens. Com `auto-offset-reset: earliest`, um group novo começa do início do tópico, em vez de ignorar o que já foi publicado.
+
+Cada instância da aplicação roda os dois listeners, então duas instâncias formam dois membros em cada group.
+
+### Experimentos
+
+Cada experimento foi montado com instâncias da aplicação em portas diferentes, todas no mesmo Mongo e no mesmo Kafka. A coluna "observado" é o que de fato aconteceu na minha máquina.
+
+| # | Experimento | Como montar | Resultado esperado | Resultado observado | Por quê |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Mesmo group, 2 instâncias | 2 instâncias (8091 e 8092), 9 pedidos de clientes `exp1-*` | As 3 partições se dividem entre elas e cada mensagem é processada por uma só | O `describe` mostrou as partições 0 e 1 com um membro (`#PARTITIONS` 2) e a partição 2 com o outro (1), lag 0. As 9 mensagens foram processadas **só pela 8092** (6 na partição 0, 3 na partição 1) e **nenhuma pela 8091**. 9 pedidos, 9 auditorias, 0 duplicatas. | Cada partição pertence a um único membro do group (nos logs aparece `protocol='range'`), então nenhuma mensagem é processada duas vezes. A divisão é de **partições**, e não de mensagens: a chave decide a partição, e os 9 clientes caíram só nas partições 0 e 1. Quem tinha a partição 2 ficou sem trabalho. O paralelismo real depende de como as chaves se distribuem, e não só do número de instâncias. |
+| 2 | Groups diferentes | Olhar `persistencia` e `auditoria` sobre as mesmas mensagens | Os dois recebem todas as mensagens | Para o prefixo `exp1-`: 9 pedidos gravados pelo A e 9 registros de auditoria do B, sem duplicatas. O group `auditoria`, criado depois, também leu desde o início um evento antigo (`cli-1`, partição 0, offset 0) que o `persistencia` já tinha consumido antes. | Cada group guarda o **seu próprio offset** por partição, e ler não consome a mensagem: o Kafka mantém o log e cada group avança no seu ritmo. Isso permite ligar um consumer novo para outro fim (auditoria, relatório) sem mexer nos que já existem, e o `earliest` faz o group novo começar do início. |
+| 3 | Mais instâncias que partições | 4 instâncias no mesmo group, com 3 partições | Uma instância fica sem partição e ociosa | Três instâncias receberam uma partição cada: nos logs, a 8092 registrou `partitions assigned: [pedidos.criados-0]` e a 8093, `[pedidos.criados-1]`, e a auditoria mostra a partição 2 com a 8091. A 8094 registrou `partitions assigned: []` nos dois groups. Mensagens por instância na auditoria: 8091 → 4, 8092 → 2, 8093 → 3, 8094 → 0. 9 pedidos, 9 auditorias. | Uma partição só pode ter um consumidor por group ao mesmo tempo, então com 3 partições o paralelismo máximo é 3. O quarto membro não acelera nada, mas fica de **reserva**, pronto para assumir. O experimento 4 mostra isso. |
+| 4 | Rebalanceamento | Derrubar uma instância com mensagens fluindo (desligamento limpo e à força) | As partições dela migram para as demais, visível nos logs | Com tráfego a cada 2 s, parei a 8093 com `Ctrl+C` (desligamento limpo). Os logs mostram `Consumer stopped` e `Graceful shutdown complete` às 12:00:55,6, e a 8094, que estava ociosa, recebeu a partição 1 (`partitions assigned: [pedidos.criados-1]`) às 12:00:55,4. A primeira mensagem seguinte dessa partição (`exp4-21`) foi consumida pela 8094 sem atraso. No total, 34 pedidos e 34 auditorias para `exp4-*`, 0 duplicatas, e o maior intervalo entre criar o evento e consumi-lo foi de 0,5 s. Na rodada à força, derrubei duas instâncias com `Stop-Process -Force`, **sem tráfego fluindo** (nenhuma mensagem foi consumida depois das 12:03, offsets finais 30, 30 e 17, lag 0). Os logs das instâncias terminam de repente, sem `Consumer stopped` nem `Graceful shutdown complete`. O log do broker mostra que elas **não** pediram para sair: foram removidas por `heartbeat expiration` (`has failed, removing it from the group`), a primeira às 12:09:06 (a que tinha as partições 0 e 1, e o group passou da geração 21 para a 22) e a segunda às 12:09:39. No desligamento limpo, o broker registrou `explicit LeaveGroup request` (por exemplo, às 12:02:36). Não anotei a hora exata dos `Stop-Process`, então o intervalo entre a morte e a remoção não está medido aqui, e como não havia tráfego também não há mensagem atrasada para mostrar. | No desligamento limpo a instância avisa o Kafka que está saindo, e o group se reorganiza na hora: a partição foi para a reserva que já estava no group, sem perda e sem reprocessamento. Quando um consumer cai **sem avisar**, o Kafka só o considera morto depois de um tempo sem sinal de vida (timeout de sessão), e nesse intervalo a partição dele fica parada. O timeout de sessão padrão do cliente é de 45 s. Numa validação separada, com tráfego fluindo, a mesma configuração e um Kafka de teste, uma partição ficou cerca de 45 s sem consumo até ser reatribuída. |
+| 5 | Ordem | 6 mensagens seguidas do mesmo `clienteId` (`exp5-ordem`) | Mesma partição, processadas na ordem de envio | Os 6 eventos foram para a partição 1, com offsets 24 a 29 consecutivos, todos pela 8092. Os logs mostram `persistencia` e `auditoria` processando em sequência, e os pedidos, ordenados por `criadoEm`, saem `seq-1` a `seq-6`. | A chave determina a partição (hash da chave), e uma partição é um log ordenado, lido por um único consumidor, um registro de cada vez. A ordem vale **dentro de uma partição**, ou seja, por cliente, e não entre clientes diferentes. Deixaria de valer se o número de partições mudasse (a mesma chave iria para outra partição) ou se o consumer processasse registros em paralelo. |
+
+O que mais surpreendeu: com 9 clientes, nenhuma mensagem foi para a partição 2 (experimento 1). Ter mais instâncias não garante trabalho para todas, porque quem decide é a chave.
+
+### Como reproduzir
+
+```bash
+./mvnw -DskipTests clean package
+java -jar target/orders-api-0.0.1-SNAPSHOT.jar --server.port=8091
+```
+
+Uma instância por terminal, mudando só a porta. A API do Compose precisa estar parada (`docker compose stop api`), senão ela entra nos groups. Use um prefixo de `clienteId` novo em cada experimento.
+
+Estado dos groups (partições, offsets, lag e dono de cada partição) e dos membros (a coluna `#PARTITIONS` mostra quem está ocioso):
+
+```bash
+docker exec pedidos-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group persistencia
+docker exec pedidos-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group persistencia --members --verbose
+```
+
+Quem processou o quê, pela auditoria (troque o prefixo do cliente):
+
+```bash
+docker exec pedidos-mongo mongosh -u pedidos -p pedidos --authenticationDatabase admin pedidos --quiet --eval "db.auditoria_eventos.find({clienteId: /^exp1-/}, {_id: 0, clienteId: 1, particao: 1, offset: 1, instancia: 1}).sort({particao: 1, offset: 1}).forEach(d => print(d.clienteId, d.particao, Number(d.offset), d.instancia))"
+```
+
+Nos logs de cada instância, as linhas `persistencia: partitions assigned: [...]` e `partitions revoked: [...]` mostram quais partições ela recebeu e perdeu.
+
 ## Testes
 
 ```bash
@@ -172,6 +223,17 @@ Os testes de integração usam Testcontainers e sobem um MongoDB e um Kafka desc
 | `PedidoEventoIntegracaoTest` | O evento chega ao tópico, com a chave do cliente, sem cabeçalhos de tipo, e o mesmo cliente cai na mesma partição |
 | `PedidoEventoServiceTest`, `PedidoEventoPublisherTest` | Montagem do evento e conversão das falhas do Kafka em `EventoNaoPublicadoException` |
 | `PedidoEventoControllerTest` | `202`, `400` sem publicar e `503` quando a fila está fora |
+| `PedidoCriadoPersistenciaListenerTest` | O consumer A grava o pedido com o `pedidoId` do evento como `_id`, status `CRIADO` e `criadoEm` igual a `ocorridoEm` |
+| `PedidoCriadoAuditoriaListenerTest` | O consumer B registra `eventId`, partição, offset e instância |
+| `ConsumersIntegracaoTest` | Um `POST /pedidos/eventos` vira pedido (consultável por `GET /pedidos/{pedidoId}`) e auditoria. O mesmo evento entregue duas vezes gera um pedido e duas auditorias |
+
+Os consumers rodam em outra thread, então os testes que dependem deles **esperam com Awaitility** (`await().atMost(...).untilAsserted(...)`) em vez de `Thread.sleep`: conferem repetidamente e terminam assim que a condição passa. Os testes de eventos e de consumers usam `clienteId` e ids próprios, porque o Mongo e o Kafka de teste são compartilhados entre as classes, e nenhum teste confere o tamanho da coleção inteira. Para checar que a suíte não depende da ordem de execução:
+
+```bash
+./mvnw test "-Dsurefire.runOrder=reversealphabetical"
+```
+
+No PowerShell, argumentos `-D` com ponto no nome precisam de aspas.
 
 ## Estrutura
 
@@ -188,7 +250,12 @@ src/main/java/com/exemplo/pedidos
 ├── kafka
 │   ├── PedidoCriado.java                                contrato do evento (record)
 │   ├── PedidoEventoPublisher.java                       única classe que fala com o KafkaTemplate
+│   ├── PedidoCriadoPersistenciaListener.java            consumer A (group persistencia)
+│   ├── PedidoCriadoAuditoriaListener.java               consumer B (group auditoria)
 │   └── KafkaTopicConfig.java                            declara o tópico pedidos.criados
+├── auditoria
+│   ├── AuditoriaEvento.java                             documento da coleção auditoria_eventos (record)
+│   └── AuditoriaEventoRepository.java
 └── erro
     ├── GlobalExceptionHandler.java                      erros viram ProblemDetail
     └── *Exception.java
@@ -206,6 +273,12 @@ src/main/java/com/exemplo/pedidos
 - **Chave da mensagem = `clienteId`.** Mensagens do mesmo cliente caem na mesma partição e mantêm a ordem entre si. O tópico tem 3 partições para a Etapa 4 ter o que mostrar nos consumer groups.
 - **`acks=all`.** O líder só confirma depois de todas as réplicas sincronizadas. Com um broker só não muda nada na prática, mas é o hábito que vale em produção.
 - **JSON sem cabeçalho de tipo.** O serializador não grava o nome da classe Java na mensagem, então o contrato é o JSON, e cada consumer escolhe em que tipo convertê-lo.
+- **Dois groups, um por finalidade.** `persistencia` e `auditoria` leem o mesmo tópico de forma independente. Acrescentar um terceiro consumer (um relatório, por exemplo) não exige mexer nos dois primeiros.
+- **O consumer A usa o `pedidoId` do evento como `_id`.** O `save` do Spring Data substitui o documento de mesmo id, então ler o mesmo evento duas vezes não cria dois pedidos. A garantia completa de idempotência fica para a Etapa 5.
+- **O `total` não é recalculado no consumer.** Ele confia no contrato: quem calcula é o servidor, ao montar o evento.
+- **A auditoria guarda a `instancia`.** É o campo que permite provar, depois do fato, qual instância processou qual partição. Sem ele, os experimentos só se veriam nos logs.
+- **Testes assíncronos esperam, não dormem.** `Thread.sleep` é lento sempre e frágil quando o consumer demora mais que o previsto. O Awaitility para na hora em que a condição passa e só falha se estourar o limite.
+- **Testes não contam coleções compartilhadas.** Com um consumer gravando em `pedidos`, "a coleção tem exatamente 1 pedido" deixa de ser verdade. Os testes verificam o pedido do cliente que eles mesmos criaram. Tentei provocar a corrida com um consumer lento e não consegui reproduzi-la, porque a janela é de poucas centenas de milissegundos, mas contar uma coleção compartilhada com um escritor assíncrono continua frágil por construção.
 - **Kafka isolado em uma classe.** Só o `PedidoEventoPublisher` conhece o `KafkaTemplate`, o que facilita testar as falhas com um dublê.
 - **Dois listeners no Kafka** (`kafka:9092` e `localhost:9094`), explicados em "Como rodar".
 - **Credenciais padrão `pedidos`/`pedidos`.** Só para desenvolvimento local. Em qualquer ambiente real, vêm de variáveis de ambiente ou de um gerenciador de segredos.
@@ -215,7 +288,7 @@ src/main/java/com/exemplo/pedidos
 - [x] Etapa 1: CRUD com MongoDB, validação e erros padronizados
 - [x] Etapa 2: testes com Testcontainers e CI no GitHub Actions
 - [x] Etapa 3: Kafka, producer
-- [ ] Etapa 4: consumers e consumer groups
+- [x] Etapa 4: consumers e consumer groups
 - [ ] Etapa 5: retry, dead-letter e idempotência
 - [ ] Etapa 6: circuit breaker com Resilience4j
 - [ ] Etapa 7: deploy do CRUD na nuvem
