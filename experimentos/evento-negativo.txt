@@ -1,0 +1,1 @@
+cli-neg#{"eventId":"11111111-1111-4111-8111-111111111111","pedidoId":"22222222-2222-4222-8222-222222222222","clienteId":"cli-neg","itens":[{"produto":"x","quantidade":1,"precoUnitario":2}],"total":-5,"ocorridoEm":"2026-10-28T15:00:00Z"}

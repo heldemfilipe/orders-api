@@ -49,6 +49,34 @@ class ConsumersIntegracaoTest {
     AuditoriaEventoRepository auditoriaRepository;
 
     @Test
+    void reentregaDoEventoNaoDesfazAlteracoesDoPedido() throws Exception {
+        String cliente = "cli-reentrega";
+        PedidoCriado evento = new PedidoCriado(UUID.randomUUID(), UUID.randomUUID(), cliente,
+                List.of(new PedidoCriado.Item("caneta", 2, new BigDecimal("3.50"))),
+                new BigDecimal("7.00"), Instant.now());
+        String pedidoId = evento.pedidoId().toString();
+
+        kafkaTemplate.send(KafkaTopicConfig.PEDIDOS_CRIADOS, cliente, evento).get(10, TimeUnit.SECONDS);
+        await().atMost(ESPERA_MAXIMA).untilAsserted(() ->
+                assertThat(pedidoRepository.findById(pedidoId)).isPresent());
+
+        Pedido pedido = pedidoRepository.findById(pedidoId).orElseThrow();
+        pedido.atualizar(pedido.getItens(), pedido.getTotal(), StatusPedido.PAGO);
+        pedidoRepository.save(pedido);
+
+        // reentrega do mesmo evento, seguida de uma sentinela na mesma particao (mesma chave):
+        // quando a sentinela aparece, a reentrega anterior ja foi processada
+        kafkaTemplate.send(KafkaTopicConfig.PEDIDOS_CRIADOS, cliente, evento).get(10, TimeUnit.SECONDS);
+        PedidoCriado sentinela = new PedidoCriado(UUID.randomUUID(), UUID.randomUUID(), cliente,
+                evento.itens(), evento.total(), Instant.now());
+        kafkaTemplate.send(KafkaTopicConfig.PEDIDOS_CRIADOS, cliente, sentinela).get(10, TimeUnit.SECONDS);
+        await().atMost(ESPERA_MAXIMA).untilAsserted(() ->
+                assertThat(pedidoRepository.findById(sentinela.pedidoId().toString())).isPresent());
+
+        assertThat(pedidoRepository.findById(pedidoId).orElseThrow().getStatus()).isEqualTo(StatusPedido.PAGO);
+    }
+
+    @Test
     void eventoPublicadoViraPedidoEAuditoria() throws Exception {
         String corpo = mvc.post().uri("/pedidos/eventos")
                 .contentType(MediaType.APPLICATION_JSON)

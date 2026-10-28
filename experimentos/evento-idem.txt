@@ -1,0 +1,1 @@
+cli-idem#{"eventId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","pedidoId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","clienteId":"cli-idem","itens":[{"produto":"x","quantidade":1,"precoUnitario":2}],"total":2,"ocorridoEm":"2026-10-28T15:00:00Z"}

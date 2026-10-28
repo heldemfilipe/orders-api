@@ -12,7 +12,8 @@ public class TestcontainersConfiguration {
     @Bean
     @ServiceConnection
     MongoDBContainer mongoDbContainer() {
-        return new MongoDBContainer("mongo:8");
+        // mongo:8 se recusa a iniciar no kernel 7.0.0-azure dos runners do GitHub (SERVER-121912)
+        return new MongoDBContainer("mongo:7.0");
     }
 
     @Bean
