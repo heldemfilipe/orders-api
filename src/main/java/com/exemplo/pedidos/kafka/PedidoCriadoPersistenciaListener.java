@@ -14,6 +14,8 @@ import com.exemplo.pedidos.pedido.ItemPedido;
 import com.exemplo.pedidos.pedido.Pedido;
 import com.exemplo.pedidos.pedido.PedidoRepository;
 import com.exemplo.pedidos.pedido.StatusPedido;
+import com.exemplo.pedidos.frete.Frete;
+import com.exemplo.pedidos.frete.FreteClient;
 
 @Component
 public class PedidoCriadoPersistenciaListener {
@@ -21,11 +23,13 @@ public class PedidoCriadoPersistenciaListener {
     private static final Logger log = LoggerFactory.getLogger(PedidoCriadoPersistenciaListener.class);
 
     private final PedidoRepository repository;
+    private final FreteClient freteClient;
     private final String instancia;
 
-    public PedidoCriadoPersistenciaListener(PedidoRepository repository,
+    public PedidoCriadoPersistenciaListener(PedidoRepository repository, FreteClient freteClient,
                                             @Value("${server.port:8080}") String instancia) {
         this.repository = repository;
+        this.freteClient = freteClient;
         this.instancia = instancia;
     }
 
@@ -41,6 +45,8 @@ public class PedidoCriadoPersistenciaListener {
 
         Pedido pedido = new Pedido(evento.pedidoId().toString(), evento.clienteId(), itens,
                 evento.total(), StatusPedido.CRIADO, evento.ocorridoEm());
+        Frete frete = freteClient.cotar(evento.clienteId());
+        pedido.definirFrete(frete.valor(), frete.estimado());
         try {
             repository.insert(pedido);
         } catch (DuplicateKeyException e) {

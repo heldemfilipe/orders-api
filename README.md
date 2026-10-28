@@ -27,6 +27,8 @@ Uma loja precisa registrar pedidos: quem comprou, o quê, quanto custa e em que 
 | Container | Docker multi-stage (JRE Alpine, usuário não-root) |
 | Mensageria | Apache Kafka 4.2 (KRaft, sem Zookeeper) com Spring Kafka |
 | Inspeção do Kafka | Kafka UI (kafbat), porta 8085 |
+| Circuit breaker | Resilience4j 2.4 (`resilience4j-spring-boot4`) |
+| Serviço de frete simulado | WireMock 3.13, porta 8089 |
 
 ## Como rodar
 
@@ -36,22 +38,23 @@ Requisitos: Docker (e JDK 25, só se for rodar sem container).
 docker compose up -d --build
 ```
 
-Sobe o MongoDB, o Kafka, o Kafka UI e a API.
+Sobe o MongoDB, o Kafka, o Kafka UI, o WireMock (serviço de frete simulado) e a API.
 
 - API: http://localhost:8080 (Swagger UI em http://localhost:8080/swagger-ui/index.html, saúde em `/actuator/health`)
 - Kafka UI: http://localhost:8085
 - Kafka para clientes que rodam no seu computador: `localhost:9094`
+- Frete simulado (WireMock): http://localhost:8089/frete?clienteId=cli-1
 
 Para desenvolver com a API fora do container, suba só a infraestrutura e rode o Maven. A porta 8080 não pode estar ocupada pelo container da API: pare-o com `docker compose stop api` ou use outra porta (`SERVER_PORT=8081`).
 
 ```bash
-docker compose up -d mongo kafka
+docker compose up -d mongo kafka frete
 ./mvnw spring-boot:run
 ```
 
 ### Configuração
 
-A aplicação lê `MONGO_USER`, `MONGO_PASSWORD`, `MONGO_HOST` e `KAFKA_BOOTSTRAP_SERVERS` do ambiente. Sem nada configurado, valem os padrões de desenvolvimento: `pedidos` / `pedidos` / `localhost` para o Mongo e `localhost:9094` para o Kafka. No Compose, a API recebe `mongo` e `kafka:9092`.
+A aplicação lê `MONGO_USER`, `MONGO_PASSWORD`, `MONGO_HOST`, `KAFKA_BOOTSTRAP_SERVERS` e `FRETE_URL` do ambiente. Sem nada configurado, valem os padrões de desenvolvimento: `pedidos` / `pedidos` / `localhost` para o Mongo, `localhost:9094` para o Kafka e `http://localhost:8089` para o frete. No Compose, a API recebe `mongo`, `kafka:9092` e `http://frete:8080`.
 
 Para trocar as credenciais do Mongo, copie `.env.example` para `.env`. Quem lê esse arquivo é o Docker Compose, que usa os valores no MongoDB e os repassa à API como variáveis de ambiente. Rodando a API fora do container (`./mvnw spring-boot:run`), ela não lê o `.env`: exporte as variáveis no terminal.
 
@@ -98,11 +101,13 @@ curl -X POST http://localhost:8080/pedidos \
   "itens": [{ "produto": "caneta", "quantidade": 2, "precoUnitario": 3.50 }],
   "total": 7.00,
   "status": "CRIADO",
-  "criadoEm": "2026-10-23T22:34:25.059Z"
+  "criadoEm": "2026-10-23T22:34:25.059Z",
+  "frete": null,
+  "freteEstimado": false
 }
 ```
 
-O `total` é calculado pelo servidor; `id`, `status` e `criadoEm` também.
+O `total` é calculado pelo servidor; `id`, `status` e `criadoEm` também. O `frete` e o `freteEstimado` só são preenchidos pelo fluxo de eventos (veja "Circuit breaker no frete" abaixo), e por isso aqui vêm vazios.
 
 ### Publicar um pedido como evento
 
@@ -163,7 +168,7 @@ O tópico `pedidos.criados` é lido por dois consumers, cada um no seu group:
 
 | Consumer | Group | O que faz |
 | --- | --- | --- |
-| A, `PedidoCriadoPersistenciaListener` | `persistencia` | Grava o `Pedido` no MongoDB, usando o `pedidoId` do evento como `_id` |
+| A, `PedidoCriadoPersistenciaListener` | `persistencia` | Consulta o frete (protegido por circuit breaker) e grava o `Pedido` no MongoDB, usando o `pedidoId` do evento como `_id` |
 | B, `PedidoCriadoAuditoriaListener` | `auditoria` | Grava em `auditoria_eventos` o `eventId`, a partição, o offset, o horário e a instância que processou |
 
 Dentro de um group, cada partição é lida por **um** membro por vez. Groups diferentes são independentes: cada um recebe **todas** as mensagens. Com `auto-offset-reset: earliest`, um group novo começa do início do tópico, em vez de ignorar o que já foi publicado.
@@ -225,7 +230,7 @@ Medições feitas numa cópia isolada do projeto (Mongo e Kafka próprios), com 
 
 | # | Experimento | Resultado observado | Por quê |
 | --- | --- | --- | --- |
-| 1 | Evento com `total` negativo (`experimentos/evento-negativo.txt`) | O documento apareceu em `mensagens_falhas` cerca de **8 s** depois da publicação, com `excecao` = `EventoInvalidoException`, `motivo` = `total negativo: -5` e `grupoOriginal` = `persistencia`. O pedido **não** foi gravado. | A espera soma 1 s + 2 s + 4 s = 7 s de tentativas, mais o envio à DLT. Repetir não adianta para um erro que é do dado, mas o custo é pequeno e cobre falhas passageiras (um Mongo que oscila). A partição de origem fica parada durante essas esperas. |
+| 1 | Evento com `total` negativo (`experimentos/evento-negativo.txt`) | O documento apareceu em `mensagens_falhas` cerca de **8 s** depois da publicação, com `excecao` = `EventoInvalidoException`, `motivo` = `total negativo: -5` e `grupoOriginal` = `persistencia`. O pedido **não** foi gravado. | A espera soma 1 s + 2 s + 4 s = 7 s de tentativas, mais o envio à DLT. Repetir não adianta para um erro que é do dado, mas o custo é pequeno e cobre falhas passageiras (um Mongo que oscila). O consumer inteiro, com todas as partições, fica parado durante essas esperas (veja o experimento 1 de "Circuit breaker no frete"). |
 | 2 | Listener da DLT falhando, **sem** proteção | O offset da partição 0 da DLT foi de 0 para 3 e para 6 em 60 s, **sem ninguém publicar nada**. | O listener da DLT também passa pelo `DefaultErrorHandler`. Quando ele falha, o recoverer publica a falha de volta na DLT, o listener lê de novo, falha de novo, e assim por diante. |
 | 3 | O mesmo, **com** a guarda (o destino é `null` para registros que já estão na DLT) | Os offsets da DLT ficaram estáveis e o group `dlt` terminou com lag 0. | Quando o resolvedor devolve `null`, o recoverer não publica. O registro dessa falha se perde, o que é uma escolha consciente: melhor perder o registro de uma falha do que travar o sistema num loop. |
 | 4 | Mensagem malformada (`experimentos/evento-malformado.txt`), **sem** `ErrorHandlingDeserializer` | O log cresceu **1,5 GB em cerca de 3 min 30 s**, a partir de **uma única** mensagem. No início, **152 linhas de erro por segundo**, sempre a mesma `RecordDeserializationException`. O processo gastou **37,6 s de CPU em 38 s** (um núcleo a 100%). Eventos válidos das partições 0 e 1 foram processados, e a partição do veneno ficou com **lag 2**, parada. | O deserializador roda dentro do `poll()`, antes do listener. O erro não chega ao `DefaultErrorHandler` do jeito esperado, o offset não avança e o `poll()` lê a mesma mensagem de novo, sem espera. O estrago fica na partição da mensagem, mas é total nela: tudo que vem depois também fica sem ser lido. |
@@ -251,13 +256,87 @@ docker exec pedidos-mongo mongosh -u pedidos -p pedidos --authenticationDatabase
 
 Cuidado com `evento-malformado.txt` **sem** o `ErrorHandlingDeserializer`: o laço de erros enche o disco em minutos. Para repetir o experimento 4, redirecione o log da aplicação para um arquivo e pare em alguns segundos.
 
+## Circuit breaker no frete
+
+Antes de gravar o pedido, o consumer A consulta um serviço de frete (`GET /frete?clienteId=...`, simulado por um WireMock no Compose). A chamada usa `RestClient` com timeout de conexão de 1 s e de leitura de 3 s, e é protegida por `@CircuitBreaker` do Resilience4j. Se o serviço falha, está lento ou o circuito está aberto, o fallback devolve um **frete padrão** (R$ 20,00, 7 dias), e o pedido é gravado com `freteEstimado: true`. O evento não vai para retry nem para a DLT por causa do frete.
+
+Os estados do circuito:
+
+| Estado | O que acontece |
+| --- | --- |
+| `CLOSED` | As chamadas passam, e o circuito conta falhas e chamadas lentas nas últimas 10 |
+| `OPEN` | Nenhuma chamada chega ao serviço: todas vão direto para o fallback (`NOT_PERMITTED`) |
+| `HALF_OPEN` | Passam 3 chamadas de teste: se vão bem, volta a `CLOSED`; se não, volta a `OPEN` |
+
+A configuração (`resilience4j.circuitbreaker.instances.frete` no `application.yaml`):
+
+| Propriedade | Valor | Efeito |
+| --- | --- | --- |
+| `sliding-window-size` | 10 | O circuito olha as 10 últimas chamadas |
+| `minimum-number-of-calls` | 10 | Só calcula a taxa com a janela cheia (o padrão é 100) |
+| `failure-rate-threshold` | 50 | Abre com 50% de falhas |
+| `slow-call-duration-threshold` / `slow-call-rate-threshold` | 2 s / 50 | Uma chamada acima de 2 s é lenta, e 50% de lentas também abre |
+| `wait-duration-in-open-state` | 10 s | Tempo aberto |
+| `permitted-number-of-calls-in-half-open-state` | 3 | Chamadas de teste |
+| `automatic-transition-from-open-to-half-open-enabled` | true | Passa a `HALF_OPEN` sozinho, sem esperar a próxima chamada |
+
+O estado fica no Actuator:
+
+```bash
+curl http://localhost:8080/actuator/circuitbreakers
+curl http://localhost:8080/actuator/circuitbreakerevents/frete
+```
+
+### Experimentos
+
+O WireMock lê `wiremock/mappings` ao subir (o frete normal: `200` com `{"valor":12.50,"prazoDias":3}`). Os arquivos de `wiremock/cenarios` sobrepõem esse stub quando aplicados (`priority: 1`). Medições feitas numa cópia isolada do projeto (Mongo, Kafka e WireMock próprios), com o mesmo código que está no repositório.
+
+| # | Experimento | Como provocar | Resultado observado | Por quê |
+| --- | --- | --- | --- | --- |
+| 1 | **Sem proteção** (referência, antes do circuit breaker) | Cenário `erro-500` com 1 evento; cenário de 5 s de atraso com 1 evento; cenário `lento-2500ms` com 4 eventos de 4 clientes | O 500 levou o evento à DLT em **8,3 s**, sem pedido gravado. O atraso de 5 s estourou o timeout de leitura (3 s) 4 vezes e levou o evento à DLT em **19,5 s** (`ResourceAccessException`). Os 4 eventos lentos, em 3 partições, ficaram prontos em **10,7 s**, um a um, de 2,5 em 2,5 s | Uma dependência doente derrubava o consumer: o pedido ia para a DLT por culpa do frete, e a thread do listener, que atende todas as partições, ficava presa esperando |
+| 2 | **Fechado** | Serviço saudável, 3 eventos | `CLOSED`, 3 chamadas, 0 falhas. Pedidos prontos em 0,6 s, com `frete` 12.50 e `freteEstimado` false | Sem falhas, o circuito não interfere |
+| 3 | **Abertura** | Cenário `erro-500`, 10 eventos | `OPEN` na **10ª chamada** da janela (3 sucessos do experimento 2 e 7 falhas, taxa de 70%). Só 7 das 10 chamadas chegaram ao WireMock; as outras 3 foram desviadas. Os 10 pedidos foram gravados com `frete` 20.00 e `freteEstimado` true. **Nenhuma** mensagem na DLT | O circuito só calcula a taxa com a janela cheia (`minimum-number-of-calls`), então não abre no 5º erro. Depois de aberto, o fallback evita a exceção, e o evento segue |
+| 4 | **Circuito aberto desvia** | Com o circuito aberto, mais 4 eventos | **Zero** chamadas ao WireMock, `naoPermitidas` subiu de 3 para 7, e os 4 pedidos saíram em 0,6 s (frete estimado) | Aberto, o circuito não toca no serviço doente e responde na hora, o que dá tempo para ele se recuperar |
+| 5 | **Recuperação** | `reset` do WireMock e esperar | `OPEN` virou `HALF_OPEN` exatos **10,0 s** depois da abertura (17:32:21,792 → 17:32:31,793 nos eventos). Com 3 eventos de teste, voltou a `CLOSED` 0,3 s depois, e os pedidos vieram com `frete` 12.50 real | Em meio-aberto o circuito deixa passar só 3 chamadas. Como as 3 foram bem, ele fecha. Se uma falhasse, voltaria a abrir |
+| 6 | **Lentidão (2,5 s)** | Cenário `lento-2500ms`, 10 eventos | 25,5 s no total. `OPEN` com **0 falhas e 10 chamadas lentas** (taxa de lentas 100%). Nenhuma mensagem na DLT | 2,5 s está acima do limite de lentidão (2 s) e abaixo do timeout (3 s): a chamada dá certo, mas é lenta, e o circuito abre por isso |
+| 7 | **Atraso de 5 s** | Cenário de 5 s de atraso, 10 eventos | 29,9 s no total. A chamada estoura o timeout de leitura de 3 s, e o circuito abre com 10 falhas (e também 10 lentas) | Aqui o caminho é o da **falha**, e não o da lentidão. Sem o timeout, a thread ficaria presa por 5 s em cada chamada |
+
+A saída de `circuitbreakerevents` desses experimentos está em [`experimentos/circuitbreakerevents-frete.json`](experimentos/circuitbreakerevents-frete.json): 22 `SUCCESS`, 17 `ERROR`, 7 `NOT_PERMITTED`, 2 `FAILURE_RATE_EXCEEDED`, 2 `SLOW_CALL_RATE_EXCEEDED` e 9 `STATE_TRANSITION`. O primeiro ciclo (experimentos 3 e 5):
+
+```
+17:32:21,792  CLOSED    -> OPEN
+17:32:31,793  OPEN      -> HALF_OPEN   (10 s depois)
+17:32:32,114  HALF_OPEN -> CLOSED      (3 chamadas de teste bem-sucedidas)
+```
+
+### Como reproduzir
+
+Pare a API do Compose (`docker compose stop api`), gere o jar e rode a aplicação na porta 8098. Aplique um cenário, publique eventos (`POST /pedidos/eventos`, com um `clienteId` novo em cada um) e consulte o Actuator:
+
+```bash
+curl -X POST -H "Content-Type: application/json" --data "@wiremock/cenarios/erro-500.json" http://localhost:8089/__admin/mappings
+curl http://localhost:8098/actuator/circuitbreakers
+```
+
+Para desfazer os cenários e voltar ao frete normal:
+
+```bash
+curl -X POST http://localhost:8089/__admin/mappings/reset
+```
+
+No PowerShell, use `curl.exe`. Se esquecer o `reset`, o cenário continua valendo.
+
+### Retry ou circuit breaker?
+
+O retry insiste: tenta de novo a mesma chamada, e é bom para falhas **passageiras** (um pico, uma conexão que caiu). Para um serviço **doente**, ele só piora: cada nova tentativa é mais carga em quem já não aguenta, e, num consumer de uma thread só, cada espera trava todas as partições (o experimento 1 mostra isso). O circuit breaker faz o oposto: depois de ver falhas demais, **para de chamar** e responde na hora com o fallback, dando tempo para o serviço voltar. Usá-los juntos faz sentido: um retry curto para o que é passageiro e o breaker para o que persiste. Pela ordem padrão do Resilience4j, o retry envolve o breaker, e então cada tentativa conta como chamada e pode abrir o circuito. Aqui só o circuit breaker está ligado; o retry da Etapa 5 continua no `DefaultErrorHandler`, mas, com o fallback, a exceção do frete nem chega até ele.
+
 ## Testes
 
 ```bash
 ./mvnw verify
 ```
 
-Os testes de integração usam Testcontainers e sobem um MongoDB 7.0 e um Kafka descartáveis (`@ServiceConnection`), então o Docker precisa estar rodando. Eles não usam o Mongo nem o Kafka do Compose. Os testes de unidade e os testes da camada web não precisam de Docker.
+Os testes de integração usam Testcontainers e sobem um MongoDB 7.0, um Kafka e um WireMock (o frete simulado, com os mesmos stubs de `wiremock/mappings`) descartáveis (`@ServiceConnection` nos dois primeiros), então o Docker precisa estar rodando. Eles não usam o Mongo nem o Kafka do Compose. Os testes de unidade e os testes da camada web não precisam de Docker.
 
 | Teste | O que prova |
 | --- | --- |
@@ -270,6 +349,7 @@ Os testes de integração usam Testcontainers e sobem um MongoDB 7.0 e um Kafka 
 | `PedidoCriadoAuditoriaListenerTest` | O consumer B registra `eventId`, partição, offset e instância |
 | `ConsumersIntegracaoTest` | Um `POST /pedidos/eventos` vira pedido (consultável por `GET /pedidos/{pedidoId}`) e auditoria. O mesmo evento entregue duas vezes gera um pedido e duas auditorias. **A reentrega não desfaz uma alteração**: um pedido pago continua `PAGO` depois de o evento voltar |
 | `FalhasIntegracaoTest` | Um evento com `total` negativo vai para a DLT depois das tentativas, é registrado em `mensagens_falhas` e não vira pedido. Uma mensagem malformada vai para a DLT com o texto original (uma vez por group) e a mensagem válida que vem depois, na mesma partição, é processada |
+| `FreteIntegracaoTest` | O frete normal chega ao pedido (`12.50`, não estimado) e o circuito fica fechado. Com o serviço devolvendo 500, as 10 primeiras chamadas abrem o circuito, as seguintes **não tocam no serviço** (o WireMock conta as requisições) e valem o frete padrão. Com o serviço recuperado e o circuito em meio-aberto, 3 chamadas de teste o fecham. Uma resposta acima de 2 s conta como chamada lenta, e não como falha. De ponta a ponta: com o serviço fora do ar, o pedido é gravado com `freteEstimado` verdadeiro e **não** vai para a DLT |
 
 Os consumers rodam em outra thread, então os testes que dependem deles **esperam com Awaitility** (`await().atMost(...).untilAsserted(...)`) em vez de `Thread.sleep`: conferem repetidamente e terminam assim que a condição passa. Os testes de eventos e de consumers usam `clienteId` e ids próprios, porque o Mongo e o Kafka de teste são compartilhados entre as classes, e nenhum teste confere o tamanho da coleção inteira. Para checar que a suíte não depende da ordem de execução:
 
@@ -313,6 +393,11 @@ src/main/java/com/exemplo/pedidos
 ├── falha
 │   ├── MensagemFalha.java                               documento da coleção mensagens_falhas (record)
 │   └── MensagemFalhaRepository.java
+├── frete
+│   ├── FreteClient.java                                 chama o serviço de frete, com circuit breaker e fallback
+│   ├── FreteConfig.java, FreteProperties.java           RestClient com timeouts e a configuração `frete.*`
+│   ├── CotacaoFrete.java                                contrato HTTP do serviço (record)
+│   └── Frete.java                                       frete do domínio, com o frete padrão do fallback
 └── erro
     ├── GlobalExceptionHandler.java                      erros viram ProblemDetail
     └── *Exception.java
@@ -339,7 +424,7 @@ src/main/java/com/exemplo/pedidos
 - **Kafka isolado em uma classe.** Só o `PedidoEventoPublisher` conhece o `KafkaTemplate`, o que facilita testar as falhas com um dublê.
 - **Dois listeners no Kafka** (`kafka:9092` e `localhost:9094`), explicados em "Como rodar".
 - **Credenciais padrão `pedidos`/`pedidos`.** Só para desenvolvimento local. Em qualquer ambiente real, vêm de variáveis de ambiente ou de um gerenciador de segredos.
-- **Retry com espera crescente, 3 tentativas (1 s, 2 s, 4 s).** Cobre falhas passageiras sem martelar o recurso que está doente. O custo é que a tentativa **bloqueia a partição**: nada atrás da mensagem com problema é lido durante os cerca de 7 s. A alternativa é um tópico de retry separado (`@RetryableTopic`), que não bloqueia, mas multiplica tópicos e a ordem por chave deixa de valer.
+- **Retry com espera crescente, 3 tentativas (1 s, 2 s, 4 s).** Cobre falhas passageiras sem martelar o recurso que está doente. O custo é que a tentativa **bloqueia o consumer inteiro**: com `concurrency` 1, a thread do listener atende as 3 partições, e nenhuma é lida durante os cerca de 7 s (na Etapa 6, quatro eventos lentos em três partições foram atendidos um a um). A alternativa é um tópico de retry separado (`@RetryableTopic`), que não bloqueia, mas multiplica tópicos e a ordem por chave deixa de valer.
 - **Nome da DLT explícito: `pedidos.criados.DLT`, na mesma partição de origem.** O nome padrão do Spring Kafka 4 é `pedidos.criados-dlt`. Com ele, a falha seria publicada em um tópico criado sozinho pelo broker, com 1 partição, sem que nada avisasse. O resolvedor explícito também mantém a ordem por partição entre o original e a DLT, e o tópico é declarado como `NewTopic`.
 - **Guarda contra loop na DLT.** Registro que já está na DLT e falha de novo é descartado, e não republicado (experimentos 2 e 3). Perder o registro dessa falha é preferível a um laço infinito.
 - **`ErrorHandlingDeserializer` com `JacksonJsonDeserializer` como delegado, e dois templates na DLT.** Sem ele, uma única mensagem malformada trava a partição e enche o disco (experimento 4). A DLT usa um template de `byte[]` para mensagens que nunca viraram objeto, e o de JSON para o resto; a ordem do `LinkedHashMap` importa, porque `byte[]` precisa ser testado antes de `Object`. O `DeadLetterListener` lê o valor como texto, então o `payload` fica legível em `mensagens_falhas`.
@@ -349,6 +434,14 @@ src/main/java/com/exemplo/pedidos
 - **Entrega *pelo menos uma vez*.** O offset só é confirmado depois de o listener terminar. Se o processo cai entre gravar e confirmar, a mensagem volta (experimento 8). Nenhum sistema evita isso; o que se faz é tornar o reprocessamento inofensivo. Idempotência, aqui, quer dizer **não corromper**, e não só "não duplicar".
 - **A DLT só registra, não reprocessa.** `mensagens_falhas` guarda o suficiente (origem, texto, exceção e motivo) para reenviar ou corrigir à mão. Um reprocessamento automático ficaria para depois. O `total` negativo é uma regra criada para exercitar o caminho de falha: a API nunca o produz, porque o servidor calcula o total.
 - **CI: falha intermitente na subida do container do MongoDB; o `mongod` se recusa a iniciar em kernels Linux 6.19 ou mais novos.** O mesmo commit falhou na primeira tentativa e passou na segunda, em `ubuntu-latest` (26.04) e em `ubuntu-24.04`, sempre na criação do container `mongo:8` pelo Testcontainers. O log completo do PR da Etapa 5 mostra o sintoma: o `mongo:8` "inicia" em 0,2 s, o `exec` de verificação do Testcontainers falha (`procReady not received` na primeira vez, código 137 na segunda) e o container já não está rodando quando o Spring pede a URL (`MongoDBContainer should be started first`). Isso se repetiu nas **duas** subidas do container no mesmo job, enquanto o Kafka subiu normalmente em cerca de 3 s; os 12 testes que falharam são consequência, e o código da Etapa 5 não participa. Um passo de diagnóstico no CI mostrou a causa: a CPU tem AVX (AMD EPYC 9V74), então a suspeita de hardware estava **errada**, e o `mongod --version` terminou com `MongoDB cannot start: Linux kernel versions 6.19 and newer has a known incompatibility with this version of MongoDB` (SERVER-121912). É uma trava deliberada das versões 8.x: uma mudança do kernel (rseq) quebra o alocador tcmalloc, e o `mongod` prefere não subir. A correção do kernel veio na 7.0.14, e o MongoDB só passou a aceitá-lo nas versões 8.0.30 e 8.3.9 (SERVER-125742). A falha é intermitente, provavelmente, porque as máquinas virtuais do runner nem sempre têm o mesmo kernel. O runner foi fixado em `ubuntu-24.04` por **reprodutibilidade** (o `ubuntu-latest` estava migrando de versão), e isso **não** foi a correção. O runner tem o kernel `7.0.0-1017-azure`: uma numeração que o MongoDB provavelmente não reconhece como a 7.0.14 corrigida (os kernels da Ubuntu numeram de outro jeito, e o MongoDB tem um ticket aberto sobre isso). No diagnóstico, `mongo:8.0`, `mongo:8.3.9` e `mongo:8` falharam e `mongo:7.0` (7.0.45) rodou. **Correção:** os testes de integração usam `mongo:7.0` (`TestcontainersConfiguration`) e a suíte passa inteira nela. O Compose continua em `mongo:8`: o volume local já foi criado pela versão 8, e a 7.0 não abre esses dados. A consequência é que testes e Compose rodam versões diferentes do MongoDB; quando o runner (ou o MongoDB) corrigir a detecção do kernel, o ideal é voltar os testes para a mesma versão do Compose.
+- **O frete é consultado antes do `insert`, dentro do consumer A.** Numa reentrega do mesmo evento, a consulta se repete antes de o `insert` descobrir que o pedido já existe: é um custo, e não um erro. A alternativa seria checar a existência do pedido antes de chamar o serviço.
+- **Contrato HTTP e tipo de domínio separados (`CotacaoFrete` e `Frete`).** O `CotacaoFrete` espelha o JSON do serviço. O fallback precisa dizer "este frete é estimado", e a primeira tentativa foi acrescentar um `boolean estimado` ao contrato: o Jackson 3 recusa o campo ausente (`Cannot map null into type boolean`, porque `FAIL_ON_NULL_FOR_PRIMITIVES` vem ligado). O `Frete` guarda o que o pedido precisa, inclusive o frete padrão.
+- **Fallback com frete padrão, e não exceção.** O frete é uma estimativa, então um valor padrão marcado como estimado é aceitável, e o pedido não pode depender da disponibilidade de um serviço de cotação. Para uma dependência em que o valor padrão **não** serve (cobrança, autorização), o fallback correto é falhar de forma explícita ou enfileirar para tentar depois, e nunca inventar um resultado.
+- **Dois mecanismos para abrir: falha e lentidão.** O timeout de leitura é de 3 s e o limite de lentidão é de 2 s, de propósito: uma resposta de 2,5 s é lenta mas bem-sucedida (abre pela taxa de lentas), e uma de 5 s estoura o timeout (abre pela taxa de falhas). Sem timeout, o limite de lentidão nunca seria alcançado por uma chamada pendurada.
+- **`minimum-number-of-calls: 10` e `automatic-transition-from-open-to-half-open-enabled`.** O padrão do primeiro é 100, o que faria o circuito demorar a abrir numa janela de 10. O segundo faz o `HALF_OPEN` aparecer no Actuator sem depender de tráfego.
+- **O estado do circuito é por instância da aplicação.** Fica em memória, na JVM. Duas instâncias do consumer abrem e fecham o circuito cada uma por si, sem coordenação.
+- **Limitação conhecida: erros 4xx também contam como falha.** O Resilience4j registra qualquer exceção por padrão, inclusive o `HttpClientErrorException` de um 400 ou 404. Se o serviço respondesse 4xx por culpa do chamador, o circuito poderia abrir sem o serviço estar doente. O ajuste seria `ignore-exceptions` para essa classe, que não foi aplicado.
+- **O WireMock serve ao Compose e aos testes.** Os mesmos stubs de `wiremock/mappings` sobem no Compose e dentro do `TestcontainersConfiguration`, e os testes aplicam os cenários de `wiremock/cenarios` pela API administrativa. O estado do circuito e o WireMock são compartilhados entre as classes que reaproveitam o contexto do Spring, então o `FreteIntegracaoTest` restaura os dois antes e depois de cada teste.
 
 ## Roteiro
 
@@ -357,7 +450,7 @@ src/main/java/com/exemplo/pedidos
 - [x] Etapa 3: Kafka, producer
 - [x] Etapa 4: consumers e consumer groups
 - [x] Etapa 5: retry, dead-letter e idempotência
-- [ ] Etapa 6: circuit breaker com Resilience4j
+- [x] Etapa 6: circuit breaker com Resilience4j
 - [ ] Etapa 7: deploy do CRUD na nuvem
 
 ## Licença

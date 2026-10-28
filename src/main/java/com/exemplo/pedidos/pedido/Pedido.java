@@ -17,6 +17,8 @@ public class Pedido {
     private BigDecimal total;
     private StatusPedido status;
     private Instant criadoEm;
+    private BigDecimal frete;
+    private boolean freteEstimado;
 
     public Pedido(String id, String clienteId, List<ItemPedido> itens, BigDecimal total,
                   StatusPedido status, Instant criadoEm) {
@@ -44,6 +46,11 @@ public class Pedido {
         this.status = status;
     }
 
+    public void definirFrete(BigDecimal frete, boolean estimado) {
+        this.frete = frete;
+        this.freteEstimado = estimado;
+    }
+
     public String getId() {
         return id;
     }
@@ -66,5 +73,13 @@ public class Pedido {
 
     public Instant getCriadoEm() {
         return criadoEm;
+    }
+    
+    public BigDecimal getFrete() {
+        return frete;
+    }
+
+    public boolean isFreteEstimado() {
+        return freteEstimado;
     }
 }

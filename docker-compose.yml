@@ -56,10 +56,13 @@ services:
       MONGO_USER: ${MONGO_USER:-pedidos}
       MONGO_PASSWORD: ${MONGO_PASSWORD:-pedidos}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      FRETE_URL: http://frete:8080
     depends_on:
       mongo:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      frete:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
@@ -80,6 +83,14 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+  frete:
+    image: wiremock/wiremock:3.13.2
+    container_name: pedidos-frete
+    restart: unless-stopped
+    ports:
+      - "8089:8080"
+    volumes:
+      - ./wiremock:/home/wiremock
 
 volumes:
   mongo-data:
