@@ -22,3 +22,7 @@ spring:
         spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
         spring.json.use.type.headers: false
         spring.json.value.default.type: com.exemplo.pedidos.kafka.PedidoCriado
+frete:
+  url: ${FRETE_URL:http://localhost:8089}
+  timeout-conexao: 1s
+  timeout-leitura: 3s

@@ -25,16 +25,20 @@ import org.springframework.dao.DuplicateKeyException;
 import com.exemplo.pedidos.pedido.Pedido;
 import com.exemplo.pedidos.pedido.PedidoRepository;
 import com.exemplo.pedidos.pedido.StatusPedido;
+import com.exemplo.pedidos.frete.CotacaoFrete;
+import com.exemplo.pedidos.frete.FreteClient;
 
 @ExtendWith(MockitoExtension.class)
 class PedidoCriadoPersistenciaListenerTest {
 
     @Mock
     PedidoRepository repository;
+    @Mock FreteClient freteClient;
 
     @Test
     void gravaPedidoComIdDoEventoEStatusCriado() {
-        PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, "8091");
+        when(freteClient.cotar("cli-1")).thenReturn(new CotacaoFrete(new BigDecimal("12.50"), 3));
+        PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, freteClient, "8091");
         PedidoCriado evento = evento(new BigDecimal("7.00"));
 
         listener.consumir(registro(evento));
@@ -49,11 +53,14 @@ class PedidoCriadoPersistenciaListenerTest {
         assertThat(pedido.getTotal()).isEqualByComparingTo("7.00");
         assertThat(pedido.getCriadoEm()).isEqualTo(Instant.parse("2026-10-28T15:00:00Z"));
         assertThat(pedido.getItens()).hasSize(1);
+        assertThat(pedido.getFrete()).isEqualByComparingTo("12.50");
+        assertThat(pedido.isFreteEstimado()).isFalse();
     }
 
     @Test
     void eventoReentregueEIgnoradoSemErroENuncaSubstituiOPedido() {
-        PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, "8091");
+        when(freteClient.cotar("cli-1")).thenReturn(new CotacaoFrete(new BigDecimal("12.50"), 3));
+        PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, freteClient, "8091");
         when(repository.insert(any(Pedido.class))).thenThrow(new DuplicateKeyException("_id duplicado"));
 
         assertThatCode(() -> listener.consumir(registro(evento(new BigDecimal("7.00")))))
@@ -64,13 +71,13 @@ class PedidoCriadoPersistenciaListenerTest {
 
     @Test
     void totalNegativoLancaEventoInvalidoSemTocarNoBanco() {
-        PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, "8091");
+        PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, freteClient, "8091");
 
         assertThatThrownBy(() -> listener.consumir(registro(evento(new BigDecimal("-1.00")))))
                 .isInstanceOf(EventoInvalidoException.class)
                 .hasMessageContaining("total negativo");
 
-        verifyNoInteractions(repository);
+        verifyNoInteractions(repository, freteClient);
     }
 
     private static PedidoCriado evento(BigDecimal total) {
