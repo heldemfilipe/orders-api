@@ -208,6 +208,49 @@ docker exec pedidos-mongo mongosh -u pedidos -p pedidos --authenticationDatabase
 
 Nos logs de cada instância, as linhas `persistencia: partitions assigned: [...]` e `partitions revoked: [...]` mostram quais partições ela recebeu e perdeu.
 
+## Falhas, retry e dead-letter
+
+O que acontece quando o consumer não consegue processar uma mensagem. Há dois tipos de falha, e cada um é tratado em um ponto diferente:
+
+| Falha | Onde acontece | O que o sistema faz |
+| --- | --- | --- |
+| **De negócio**: o listener lança uma exceção (hoje, `EventoInvalidoException` para `total` negativo) | Dentro do listener | `DefaultErrorHandler` tenta de novo 3 vezes, esperando 1 s, 2 s e 4 s. Se continuar falhando, o `DeadLetterPublishingRecoverer` publica a mensagem em `pedidos.criados.DLT` e o offset avança |
+| **Mensagem ilegível**: o JSON está quebrado (*poison pill*) | No `poll()`, antes de o listener ser chamado | O `ErrorHandlingDeserializer` guarda o erro em vez de lançá-lo, e a mensagem segue o mesmo caminho até a DLT, com os **bytes originais** |
+
+Quem lê a DLT é o `DeadLetterListener` (group `dlt`), que grava cada mensagem em `mensagens_falhas` com o tópico, a partição e o offset de origem, o group que falhou, a chave, o texto original, a exceção e o motivo. A DLT só **registra** a falha: não há reprocessamento automático.
+
+### Experimentos
+
+Medições feitas numa cópia isolada do projeto (Mongo e Kafka próprios), com o mesmo código que está no repositório.
+
+| # | Experimento | Resultado observado | Por quê |
+| --- | --- | --- | --- |
+| 1 | Evento com `total` negativo (`experimentos/evento-negativo.txt`) | O documento apareceu em `mensagens_falhas` cerca de **8 s** depois da publicação, com `excecao` = `EventoInvalidoException`, `motivo` = `total negativo: -5` e `grupoOriginal` = `persistencia`. O pedido **não** foi gravado. | A espera soma 1 s + 2 s + 4 s = 7 s de tentativas, mais o envio à DLT. Repetir não adianta para um erro que é do dado, mas o custo é pequeno e cobre falhas passageiras (um Mongo que oscila). A partição de origem fica parada durante essas esperas. |
+| 2 | Listener da DLT falhando, **sem** proteção | O offset da partição 0 da DLT foi de 0 para 3 e para 6 em 60 s, **sem ninguém publicar nada**. | O listener da DLT também passa pelo `DefaultErrorHandler`. Quando ele falha, o recoverer publica a falha de volta na DLT, o listener lê de novo, falha de novo, e assim por diante. |
+| 3 | O mesmo, **com** a guarda (o destino é `null` para registros que já estão na DLT) | Os offsets da DLT ficaram estáveis e o group `dlt` terminou com lag 0. | Quando o resolvedor devolve `null`, o recoverer não publica. O registro dessa falha se perde, o que é uma escolha consciente: melhor perder o registro de uma falha do que travar o sistema num loop. |
+| 4 | Mensagem malformada (`experimentos/evento-malformado.txt`), **sem** `ErrorHandlingDeserializer` | O log cresceu **1,5 GB em cerca de 3 min 30 s**, a partir de **uma única** mensagem. No início, **152 linhas de erro por segundo**, sempre a mesma `RecordDeserializationException`. O processo gastou **37,6 s de CPU em 38 s** (um núcleo a 100%). Eventos válidos das partições 0 e 1 foram processados, e a partição do veneno ficou com **lag 2**, parada. | O deserializador roda dentro do `poll()`, antes do listener. O erro não chega ao `DefaultErrorHandler` do jeito esperado, o offset não avança e o `poll()` lê a mesma mensagem de novo, sem espera. O estrago fica na partição da mensagem, mas é total nela: tudo que vem depois também fica sem ser lido. |
+| 5 | A mesma mensagem **com** `ErrorHandlingDeserializer` | A mensagem foi para a DLT sem passar pelas tentativas e o consumer seguiu. No `mensagens_falhas`, o texto original aparece **intacto**, uma vez por group que falhou (`persistencia` e `auditoria`). | O deserializador entrega o erro como dado, e não como exceção, então o fluxo normal da DLT vale. Os bytes originais são preservados por um segundo template, de `byte[]`: o template JSON reserializaria os bytes como uma string JSON (em base64), e o texto original se perderia. |
+| 6 | Reentrega do mesmo evento depois de o pedido ser pago, com `save` | O pedido voltou de `PAGO` (total 6, quantidade 3) para `CRIADO` (total 2, quantidade 1). Continuava **1 documento**. | O `save` substitui o documento de mesmo `_id`. Impede duplicar, mas desfaz o que mudou depois. Por isso o teste da Etapa 4 (um pedido para dois eventos) passava e escondia o problema. |
+| 7 | O mesmo, com `insert` e `DuplicateKeyException` | O pedido continuou `PAGO` (total 6, quantidade 3). O log registrou `ja existe (evento ... reentregue), ignorando`, e a auditoria registrou as duas entregas. | O `insert` recusa um `_id` que já existe, e o consumer trata a recusa como "já processei". A auditoria é um registro do que chegou, e não um efeito idempotente. |
+| 8 | Queda do consumer depois de gravar e antes de confirmar (pausa temporária de 10 s após o `insert`, processo morto à força) | Com o consumer pausado, o pedido já estava no Mongo e o **lag era 1**. Depois da queda: 1 documento, lag 1. Ao reiniciar: `ja existe ... reentregue, ignorando`, **1 documento** e lag 0. | O Kafka só considera a mensagem processada quando o listener termina e o offset é confirmado. Se o processo morre no meio, a mensagem volta (entrega *pelo menos uma vez*). Como o `insert` é idempotente, a volta é inofensiva. |
+
+### Como reproduzir
+
+Os eventos dos experimentos estão em `experimentos/`: um arquivo por evento, no formato `chave#json`. Publicar um deles:
+
+```bash
+docker cp experimentos/evento-negativo.txt pedidos-kafka:/tmp/evento-negativo.txt
+docker exec pedidos-kafka sh -c "/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic pedidos.criados --reader-property parse.key=true --reader-property key.separator=# < /tmp/evento-negativo.txt"
+```
+
+O que a DLT registrou:
+
+```bash
+docker exec pedidos-mongo mongosh -u pedidos -p pedidos --authenticationDatabase admin pedidos --quiet --eval "db.mensagens_falhas.find({}, {_id: 0}).forEach(d => printjson(d))"
+```
+
+Cuidado com `evento-malformado.txt` **sem** o `ErrorHandlingDeserializer`: o laço de erros enche o disco em minutos. Para repetir o experimento 4, redirecione o log da aplicação para um arquivo e pare em alguns segundos.
+
 ## Testes
 
 ```bash
@@ -223,9 +266,10 @@ Os testes de integração usam Testcontainers e sobem um MongoDB e um Kafka desc
 | `PedidoEventoIntegracaoTest` | O evento chega ao tópico, com a chave do cliente, sem cabeçalhos de tipo, e o mesmo cliente cai na mesma partição |
 | `PedidoEventoServiceTest`, `PedidoEventoPublisherTest` | Montagem do evento e conversão das falhas do Kafka em `EventoNaoPublicadoException` |
 | `PedidoEventoControllerTest` | `202`, `400` sem publicar e `503` quando a fila está fora |
-| `PedidoCriadoPersistenciaListenerTest` | O consumer A grava o pedido com o `pedidoId` do evento como `_id`, status `CRIADO` e `criadoEm` igual a `ocorridoEm` |
+| `PedidoCriadoPersistenciaListenerTest` | O consumer A grava o pedido (com `insert`) usando o `pedidoId` do evento como `_id`, status `CRIADO` e `criadoEm` igual a `ocorridoEm`; ignora um evento reentregue sem erro e sem nunca chamar `save`; lança `EventoInvalidoException` para `total` negativo sem tocar no banco |
 | `PedidoCriadoAuditoriaListenerTest` | O consumer B registra `eventId`, partição, offset e instância |
-| `ConsumersIntegracaoTest` | Um `POST /pedidos/eventos` vira pedido (consultável por `GET /pedidos/{pedidoId}`) e auditoria. O mesmo evento entregue duas vezes gera um pedido e duas auditorias |
+| `ConsumersIntegracaoTest` | Um `POST /pedidos/eventos` vira pedido (consultável por `GET /pedidos/{pedidoId}`) e auditoria. O mesmo evento entregue duas vezes gera um pedido e duas auditorias. **A reentrega não desfaz uma alteração**: um pedido pago continua `PAGO` depois de o evento voltar |
+| `FalhasIntegracaoTest` | Um evento com `total` negativo vai para a DLT depois das tentativas, é registrado em `mensagens_falhas` e não vira pedido. Uma mensagem malformada vai para a DLT com o texto original (uma vez por group) e a mensagem válida que vem depois, na mesma partição, é processada |
 
 Os consumers rodam em outra thread, então os testes que dependem deles **esperam com Awaitility** (`await().atMost(...).untilAsserted(...)`) em vez de `Thread.sleep`: conferem repetidamente e terminam assim que a condição passa. Os testes de eventos e de consumers usam `clienteId` e ids próprios, porque o Mongo e o Kafka de teste são compartilhados entre as classes, e nenhum teste confere o tamanho da coleção inteira. Para checar que a suíte não depende da ordem de execução:
 
@@ -234,6 +278,13 @@ Os consumers rodam em outra thread, então os testes que dependem deles **espera
 ```
 
 No PowerShell, argumentos `-D` com ponto no nome precisam de aspas.
+
+Dois cuidados nos testes de falha e reentrega:
+
+- **Sentinela em vez de espera fixa.** Para provar que uma reentrega *não* mudou nada, o teste precisa saber que ela já foi processada. Esperar a auditoria não serve (é outro group), e dormir é frágil. O teste publica depois da reentrega uma mensagem sentinela com a mesma chave: a mesma partição é lida em ordem, então, quando a sentinela aparece no banco, a reentrega anterior já passou.
+- **Um produtor de bytes crus para o veneno.** O `KafkaTemplate` da aplicação sempre serializa para JSON, então não consegue publicar uma mensagem malformada. O teste cria um produtor de `byte[]` apontado para o Kafka do Testcontainers.
+
+`FalhasIntegracaoTest` usa as mesmas anotações de `ConsumersIntegracaoTest`, para o Spring reaproveitar o contexto e os containers entre as duas classes.
 
 ## Estrutura
 
@@ -252,10 +303,16 @@ src/main/java/com/exemplo/pedidos
 │   ├── PedidoEventoPublisher.java                       única classe que fala com o KafkaTemplate
 │   ├── PedidoCriadoPersistenciaListener.java            consumer A (group persistencia)
 │   ├── PedidoCriadoAuditoriaListener.java               consumer B (group auditoria)
-│   └── KafkaTopicConfig.java                            declara o tópico pedidos.criados
+│   ├── DeadLetterListener.java                          lê a DLT e registra a falha (group dlt)
+│   ├── EventoInvalidoException.java                     falha de negócio do consumer A
+│   ├── KafkaTopicConfig.java                            declara o tópico pedidos.criados
+│   └── KafkaErroConfig.java                             retry, DLT e proteção contra loop
 ├── auditoria
 │   ├── AuditoriaEvento.java                             documento da coleção auditoria_eventos (record)
 │   └── AuditoriaEventoRepository.java
+├── falha
+│   ├── MensagemFalha.java                               documento da coleção mensagens_falhas (record)
+│   └── MensagemFalhaRepository.java
 └── erro
     ├── GlobalExceptionHandler.java                      erros viram ProblemDetail
     └── *Exception.java
@@ -274,7 +331,7 @@ src/main/java/com/exemplo/pedidos
 - **`acks=all`.** O líder só confirma depois de todas as réplicas sincronizadas. Com um broker só não muda nada na prática, mas é o hábito que vale em produção.
 - **JSON sem cabeçalho de tipo.** O serializador não grava o nome da classe Java na mensagem, então o contrato é o JSON, e cada consumer escolhe em que tipo convertê-lo.
 - **Dois groups, um por finalidade.** `persistencia` e `auditoria` leem o mesmo tópico de forma independente. Acrescentar um terceiro consumer (um relatório, por exemplo) não exige mexer nos dois primeiros.
-- **O consumer A usa o `pedidoId` do evento como `_id`.** O `save` do Spring Data substitui o documento de mesmo id, então ler o mesmo evento duas vezes não cria dois pedidos. A garantia completa de idempotência fica para a Etapa 5.
+- **O consumer A usa o `pedidoId` do evento como `_id` e grava com `insert`.** Na Etapa 4 era `save`, que substitui o documento de mesmo id: não duplicava, mas a reentrega desfazia um pagamento (experimento 6 de "Falhas"). Com `insert`, o banco recusa o `_id` repetido, e o consumer trata o `DuplicateKeyException` como "já processei" (veja "Idempotência" abaixo).
 - **O `total` não é recalculado no consumer.** Ele confia no contrato: quem calcula é o servidor, ao montar o evento.
 - **A auditoria guarda a `instancia`.** É o campo que permite provar, depois do fato, qual instância processou qual partição. Sem ele, os experimentos só se veriam nos logs.
 - **Testes assíncronos esperam, não dormem.** `Thread.sleep` é lento sempre e frágil quando o consumer demora mais que o previsto. O Awaitility para na hora em que a condição passa e só falha se estourar o limite.
@@ -282,6 +339,16 @@ src/main/java/com/exemplo/pedidos
 - **Kafka isolado em uma classe.** Só o `PedidoEventoPublisher` conhece o `KafkaTemplate`, o que facilita testar as falhas com um dublê.
 - **Dois listeners no Kafka** (`kafka:9092` e `localhost:9094`), explicados em "Como rodar".
 - **Credenciais padrão `pedidos`/`pedidos`.** Só para desenvolvimento local. Em qualquer ambiente real, vêm de variáveis de ambiente ou de um gerenciador de segredos.
+- **Retry com espera crescente, 3 tentativas (1 s, 2 s, 4 s).** Cobre falhas passageiras sem martelar o recurso que está doente. O custo é que a tentativa **bloqueia a partição**: nada atrás da mensagem com problema é lido durante os cerca de 7 s. A alternativa é um tópico de retry separado (`@RetryableTopic`), que não bloqueia, mas multiplica tópicos e a ordem por chave deixa de valer.
+- **Nome da DLT explícito: `pedidos.criados.DLT`, na mesma partição de origem.** O nome padrão do Spring Kafka 4 é `pedidos.criados-dlt`. Com ele, a falha seria publicada em um tópico criado sozinho pelo broker, com 1 partição, sem que nada avisasse. O resolvedor explícito também mantém a ordem por partição entre o original e a DLT, e o tópico é declarado como `NewTopic`.
+- **Guarda contra loop na DLT.** Registro que já está na DLT e falha de novo é descartado, e não republicado (experimentos 2 e 3). Perder o registro dessa falha é preferível a um laço infinito.
+- **`ErrorHandlingDeserializer` com `JacksonJsonDeserializer` como delegado, e dois templates na DLT.** Sem ele, uma única mensagem malformada trava a partição e enche o disco (experimento 4). A DLT usa um template de `byte[]` para mensagens que nunca viraram objeto, e o de JSON para o resto; a ordem do `LinkedHashMap` importa, porque `byte[]` precisa ser testado antes de `Object`. O `DeadLetterListener` lê o valor como texto, então o `payload` fica legível em `mensagens_falhas`.
+- **O template de `byte[]` herda a configuração do produtor JSON.** A primeira versão o criava a partir de `KafkaProperties`, que só lê o `application.yaml` e ignora o endereço que o Testcontainers injeta (`@ServiceConnection`). Em produção funcionava, porque o endereço vem do yaml, mas no teste o veneno ia para `localhost:9094`, a DLT nunca recebia e a partição ficava presa. O teste de integração descobriu o erro. Agora o template parte de `getProducerFactory().getConfigurationProperties()` do template JSON, que já traz o endereço certo.
+- **Idempotência pela chave natural `pedidoId`, e não por um `eventId` guardado à parte.** Na API os dois são 1 para 1, e o `pedidoId` já é o `_id`, então o banco garante a unicidade com **uma** gravação. Uma coleção de "eventos processados" exigiria **duas** (marcar o evento e gravar o pedido), e o Mongo do Compose é um nó só, sem transação entre elas: uma queda entre as duas deixaria o evento marcado sem virar pedido, perdido para sempre.
+- **Limites da idempotência.** (1) O `insert` ignora **qualquer** segundo evento com o mesmo `pedidoId`, e não só reentregas; um produtor com bug que reutilizasse o id teria o segundo evento descartado (com um `warn` no log). (2) Proteger contra a reentrega do evento não protege contra o cliente que repete o `POST /pedidos/eventos`: cada chamada gera ids novos e, portanto, outro pedido. Isso exigiria uma chave de idempotência enviada pelo cliente.
+- **Entrega *pelo menos uma vez*.** O offset só é confirmado depois de o listener terminar. Se o processo cai entre gravar e confirmar, a mensagem volta (experimento 8). Nenhum sistema evita isso; o que se faz é tornar o reprocessamento inofensivo. Idempotência, aqui, quer dizer **não corromper**, e não só "não duplicar".
+- **A DLT só registra, não reprocessa.** `mensagens_falhas` guarda o suficiente (origem, texto, exceção e motivo) para reenviar ou corrigir à mão. Um reprocessamento automático ficaria para depois. O `total` negativo é uma regra criada para exercitar o caminho de falha: a API nunca o produz, porque o servidor calcula o total.
+- **CI: falha intermitente na subida do container do MongoDB, causa não identificada.** O mesmo commit falhou na primeira tentativa e passou na segunda, em `ubuntu-latest` (26.04) e em `ubuntu-24.04`, sempre na criação do container `mongo:8` pelo Testcontainers; os logs do Actions não deram a causa. O runner foi fixado em `ubuntu-24.04` por **reprodutibilidade** (o `ubuntu-latest` estava migrando de versão), e isso **não** foi a correção. Se voltar a falhar, o próximo passo é ligar o log do container (`withLogConsumer`) e um passo de diagnóstico da CPU no CI.
 
 ## Roteiro
 
@@ -289,7 +356,7 @@ src/main/java/com/exemplo/pedidos
 - [x] Etapa 2: testes com Testcontainers e CI no GitHub Actions
 - [x] Etapa 3: Kafka, producer
 - [x] Etapa 4: consumers e consumer groups
-- [ ] Etapa 5: retry, dead-letter e idempotência
+- [x] Etapa 5: retry, dead-letter e idempotência
 - [ ] Etapa 6: circuit breaker com Resilience4j
 - [ ] Etapa 7: deploy do CRUD na nuvem
 
