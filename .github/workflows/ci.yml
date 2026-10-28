@@ -20,11 +20,16 @@ jobs:
           java-version: "25"
           cache: maven
 
-      - name: Diagnostico (CPU e MongoDB)
+      - name: Diagnostico (kernel e MongoDB)
         run: |
-          grep -m1 'model name' /proc/cpuinfo
-          echo "avx: $(grep -m1 -o -w avx /proc/cpuinfo || echo AUSENTE)"
-          docker run --rm mongo:8 mongod --version || echo "mongod falhou com codigo $?"
+          uname -r
+          for tag in 7.0 8.0 8.3.9 8; do
+            if out=$(docker run --rm mongo:$tag mongod --version 2>&1); then
+              echo "mongo:$tag OK -> $(echo "$out" | grep -m1 'db version')"
+            else
+              echo "mongo:$tag FALHA -> $(echo "$out" | grep -m1 'MongoDB cannot start' | cut -c1-160)"
+            fi
+          done
 
       - name: Build e testes
         run: ./mvnw -B -ntp verify
