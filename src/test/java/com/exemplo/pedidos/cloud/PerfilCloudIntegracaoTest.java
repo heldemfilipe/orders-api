@@ -19,7 +19,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 import org.testcontainers.mongodb.MongoDBContainer;
 
-import com.exemplo.pedidos.frete.FreteClient;
+import com.exemplo.pedidos.application.port.out.FretePort;
 
 // sem container de Kafka: se alguma classe do perfil cloud ainda precisasse do broker, o contexto nao subiria
 @SpringBootTest(properties = "MONGODB_URI=mongodb://substituida-pelo-testcontainers:27017/pedidos")
@@ -48,7 +48,7 @@ class PerfilCloudIntegracaoTest {
     void contextoSobeSemNadaDeKafkaNemDeFrete() {
         assertThat(contexto.getBeanNamesForType(KafkaTemplate.class)).isEmpty();
         assertThat(contexto.getBeanNamesForType(KafkaListenerEndpointRegistry.class)).isEmpty();
-        assertThat(contexto.getBeanNamesForType(FreteClient.class)).isEmpty();
+        assertThat(contexto.getBeanNamesForType(FretePort.class)).isEmpty();
         assertThat(contexto.containsBean("pedidoCriadoPersistenciaListener")).isFalse();
         assertThat(contexto.containsBean("pedidoCriadoAuditoriaListener")).isFalse();
         assertThat(contexto.containsBean("deadLetterListener")).isFalse();

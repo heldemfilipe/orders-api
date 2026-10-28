@@ -26,11 +26,13 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.testcontainers.containers.GenericContainer;
 
 import com.exemplo.pedidos.TestcontainersConfiguration;
-import com.exemplo.pedidos.falha.MensagemFalhaRepository;
-import com.exemplo.pedidos.kafka.KafkaTopicConfig;
-import com.exemplo.pedidos.kafka.PedidoCriado;
-import com.exemplo.pedidos.pedido.Pedido;
-import com.exemplo.pedidos.pedido.PedidoRepository;
+import com.exemplo.pedidos.application.port.out.FretePort;
+import com.exemplo.pedidos.domain.Frete;
+import com.exemplo.pedidos.adapter.out.mongo.MensagemFalhaRepository;
+import com.exemplo.pedidos.adapter.kafka.KafkaTopicConfig;
+import com.exemplo.pedidos.adapter.kafka.PedidoCriado;
+import com.exemplo.pedidos.domain.Pedido;
+import com.exemplo.pedidos.application.port.out.PedidoRepositoryPort;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
@@ -46,7 +48,7 @@ class FreteIntegracaoTest {
     private static final Duration ESPERA_MAXIMA = Duration.ofSeconds(20);
 
     @Autowired
-    FreteClient freteClient;
+    FretePort freteClient;
 
     @Autowired
     CircuitBreakerRegistry registro;
@@ -59,7 +61,7 @@ class FreteIntegracaoTest {
     KafkaTemplate<String, PedidoCriado> kafkaTemplate;
 
     @Autowired
-    PedidoRepository pedidoRepository;
+    PedidoRepositoryPort pedidoRepository;
 
     @Autowired
     MensagemFalhaRepository falhaRepository;
@@ -196,7 +198,7 @@ class FreteIntegracaoTest {
     private Pedido esperarPedido(PedidoCriado evento) {
         String id = evento.pedidoId().toString();
         await().atMost(ESPERA_MAXIMA).untilAsserted(() ->
-                assertThat(pedidoRepository.findById(id)).isPresent());
-        return pedidoRepository.findById(id).orElseThrow();
+                assertThat(pedidoRepository.buscarPorId(id)).isPresent());
+        return pedidoRepository.buscarPorId(id).orElseThrow();
     }
 }

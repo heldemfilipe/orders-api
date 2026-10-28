@@ -1,0 +1,49 @@
+package com.exemplo.pedidos.adapter.in.kafka;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.verify;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import com.exemplo.pedidos.adapter.kafka.KafkaTopicConfig;
+import com.exemplo.pedidos.adapter.kafka.PedidoCriado;
+import com.exemplo.pedidos.application.RegistroAuditoria;
+import com.exemplo.pedidos.application.port.in.RegistrarAuditoriaUseCase;
+
+@ExtendWith(MockitoExtension.class)
+class PedidoCriadoAuditoriaListenerTest {
+
+    @Mock
+    RegistrarAuditoriaUseCase useCase;
+
+    @Test
+    void registraEventoParticaoOffsetEInstancia() {
+        PedidoCriadoAuditoriaListener listener = new PedidoCriadoAuditoriaListener(useCase, "8091");
+        PedidoCriado evento = new PedidoCriado(UUID.randomUUID(), UUID.randomUUID(), "cli-1",
+                List.of(new PedidoCriado.Item("caneta", 2, new BigDecimal("3.50"))),
+                new BigDecimal("7.00"), Instant.now());
+
+        listener.auditar(new ConsumerRecord<>(KafkaTopicConfig.PEDIDOS_CRIADOS, 2, 17L, "cli-1", evento));
+
+        ArgumentCaptor<RegistroAuditoria> captor = ArgumentCaptor.forClass(RegistroAuditoria.class);
+        verify(useCase).registrar(captor.capture());
+        RegistroAuditoria auditoria = captor.getValue();
+
+        assertThat(auditoria.eventId()).isEqualTo(evento.eventId().toString());
+        assertThat(auditoria.clienteId()).isEqualTo("cli-1");
+        assertThat(auditoria.particao()).isEqualTo(2);
+        assertThat(auditoria.offset()).isEqualTo(17L);
+        assertThat(auditoria.instancia()).isEqualTo("8091");
+        assertThat(auditoria.recebidoEm()).isNotNull();
+    }
+}
