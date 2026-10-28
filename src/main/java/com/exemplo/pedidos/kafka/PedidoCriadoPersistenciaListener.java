@@ -31,6 +31,9 @@ public class PedidoCriadoPersistenciaListener {
     @KafkaListener(topics = KafkaTopicConfig.PEDIDOS_CRIADOS, groupId = "persistencia")
     public void consumir(ConsumerRecord<String, PedidoCriado> registro) {
         PedidoCriado evento = registro.value();
+        if (evento.total().signum() < 0) {
+            throw new EventoInvalidoException("total negativo: " + evento.total());
+        }
         List<ItemPedido> itens = evento.itens().stream()
                 .map(i -> new ItemPedido(i.produto(), i.quantidade(), i.precoUnitario()))
                 .toList();
