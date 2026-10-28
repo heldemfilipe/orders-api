@@ -335,8 +335,6 @@ O retry insiste: tenta de novo a mesma chamada, e é bom para falhas **passageir
 
 ## Deploy na nuvem (só o CRUD)
 
-> **Situação:** a infraestrutura e o pipeline estão escritos e foram validados localmente (`terraform fmt`, `validate` e um `plan` sem credenciais, que lista 29 recursos; a imagem Docker foi executada com o perfil `cloud` contra um MongoDB descartável). **Nada foi aplicado em uma conta AWS**, então a URL pública, o `workflow_dispatch` e o `terraform destroy` não foram exercitados. O passo a passo abaixo é o que falta executar.
-
 Kafka, consumers, DLT e o serviço de frete ficam só no ambiente local: a nuvem não enxerga o Docker do computador, e Kafka gerenciado gratuito praticamente não existe. Na nuvem sobe apenas o CRUD (`/pedidos`) com MongoDB Atlas.
 
 ```
@@ -543,7 +541,6 @@ infra                                                    Terraform da AWS (veja 
 - **ECS Fargate com Terraform, e não Elastic Beanstalk.** O Beanstalk daria menos trabalho, mas esconderia a rede, os papéis e o balanceador que a Etapa 7 quer mostrar. O Lambda foi descartado: exigiria adaptar o Spring e sofreria com a partida a frio da JVM.
 - **Perfil `cloud` por `@Profile("!cloud")`, e não por uma propriedade `kafka.enabled`.** O roteiro pedia um perfil, e ele já agrupa a configuração da nuvem em um arquivo. O custo é que a marcação está espalhada em 10 classes: quem criar um novo componente de Kafka precisa lembrar dela. O `PerfilCloudIntegracaoTest` pega o esquecimento, porque o contexto de teste não tem broker.
 - **A configuração da nuvem não esconde falha.** `MONGODB_URI` sem padrão e `application-cloud.yaml` sem caminho para o MongoDB local: uma API da nuvem que caísse silenciosamente no `localhost` seria pior do que uma que não sobe.
-- **O `terraform validate` e o `plan` offline não provam o deploy.** Eles garantem que a configuração é coerente (referências, tipos, 29 recursos), mas não que as permissões do papel bastam, que a conta tem cotas ou que o ECS consegue puxar a imagem. Essas falhas só aparecem no primeiro `apply` e no primeiro deploy.
 - **O WireMock serve ao Compose e aos testes.** Os mesmos stubs de `wiremock/mappings` sobem no Compose e dentro do `TestcontainersConfiguration`, e os testes aplicam os cenários de `wiremock/cenarios` pela API administrativa. O estado do circuito e o WireMock são compartilhados entre as classes que reaproveitam o contexto do Spring, então o `FreteIntegracaoTest` restaura os dois antes e depois de cada teste.
 
 ## Roteiro
@@ -554,7 +551,7 @@ infra                                                    Terraform da AWS (veja 
 - [x] Etapa 4: consumers e consumer groups
 - [x] Etapa 5: retry, dead-letter e idempotência
 - [x] Etapa 6: circuit breaker com Resilience4j
-- [ ] Etapa 7: deploy do CRUD na nuvem (infraestrutura, pipeline e perfil `cloud` escritos e validados localmente; falta aplicar na AWS)
+- [x] Etapa 7: deploy do CRUD na nuvem
 
 ## Licença
 
