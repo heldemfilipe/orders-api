@@ -223,6 +223,17 @@ Os testes de integração usam Testcontainers e sobem um MongoDB e um Kafka desc
 | `PedidoEventoIntegracaoTest` | O evento chega ao tópico, com a chave do cliente, sem cabeçalhos de tipo, e o mesmo cliente cai na mesma partição |
 | `PedidoEventoServiceTest`, `PedidoEventoPublisherTest` | Montagem do evento e conversão das falhas do Kafka em `EventoNaoPublicadoException` |
 | `PedidoEventoControllerTest` | `202`, `400` sem publicar e `503` quando a fila está fora |
+| `PedidoCriadoPersistenciaListenerTest` | O consumer A grava o pedido com o `pedidoId` do evento como `_id`, status `CRIADO` e `criadoEm` igual a `ocorridoEm` |
+| `PedidoCriadoAuditoriaListenerTest` | O consumer B registra `eventId`, partição, offset e instância |
+| `ConsumersIntegracaoTest` | Um `POST /pedidos/eventos` vira pedido (consultável por `GET /pedidos/{pedidoId}`) e auditoria. O mesmo evento entregue duas vezes gera um pedido e duas auditorias |
+
+Os consumers rodam em outra thread, então os testes que dependem deles **esperam com Awaitility** (`await().atMost(...).untilAsserted(...)`) em vez de `Thread.sleep`: conferem repetidamente e terminam assim que a condição passa. Os testes de eventos e de consumers usam `clienteId` e ids próprios, porque o Mongo e o Kafka de teste são compartilhados entre as classes, e nenhum teste confere o tamanho da coleção inteira. Para checar que a suíte não depende da ordem de execução:
+
+```bash
+./mvnw test "-Dsurefire.runOrder=reversealphabetical"
+```
+
+No PowerShell, argumentos `-D` com ponto no nome precisam de aspas.
 
 ## Estrutura
 
@@ -266,6 +277,8 @@ src/main/java/com/exemplo/pedidos
 - **O consumer A usa o `pedidoId` do evento como `_id`.** O `save` do Spring Data substitui o documento de mesmo id, então ler o mesmo evento duas vezes não cria dois pedidos. A garantia completa de idempotência fica para a Etapa 5.
 - **O `total` não é recalculado no consumer.** Ele confia no contrato: quem calcula é o servidor, ao montar o evento.
 - **A auditoria guarda a `instancia`.** É o campo que permite provar, depois do fato, qual instância processou qual partição. Sem ele, os experimentos só se veriam nos logs.
+- **Testes assíncronos esperam, não dormem.** `Thread.sleep` é lento sempre e frágil quando o consumer demora mais que o previsto. O Awaitility para na hora em que a condição passa e só falha se estourar o limite.
+- **Testes não contam coleções compartilhadas.** Com um consumer gravando em `pedidos`, "a coleção tem exatamente 1 pedido" deixa de ser verdade. Os testes verificam o pedido do cliente que eles mesmos criaram. Tentei provocar a corrida com um consumer lento e não consegui reproduzi-la, porque a janela é de poucas centenas de milissegundos, mas contar uma coleção compartilhada com um escritor assíncrono continua frágil por construção.
 - **Kafka isolado em uma classe.** Só o `PedidoEventoPublisher` conhece o `KafkaTemplate`, o que facilita testar as falhas com um dublê.
 - **Dois listeners no Kafka** (`kafka:9092` e `localhost:9094`), explicados em "Como rodar".
 - **Credenciais padrão `pedidos`/`pedidos`.** Só para desenvolvimento local. Em qualquer ambiente real, vêm de variáveis de ambiente ou de um gerenciador de segredos.
@@ -275,7 +288,7 @@ src/main/java/com/exemplo/pedidos
 - [x] Etapa 1: CRUD com MongoDB, validação e erros padronizados
 - [x] Etapa 2: testes com Testcontainers e CI no GitHub Actions
 - [x] Etapa 3: Kafka, producer
-- [ ] Etapa 4: consumers e consumer groups
+- [x] Etapa 4: consumers e consumer groups
 - [ ] Etapa 5: retry, dead-letter e idempotência
 - [ ] Etapa 6: circuit breaker com Resilience4j
 - [ ] Etapa 7: deploy do CRUD na nuvem
