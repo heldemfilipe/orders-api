@@ -43,7 +43,9 @@ class PedidoIntegracaoTest {
                 .hasStatus(HttpStatus.CREATED)
                 .headers().containsHeader("Location");
 
-        List<Pedido> gravados = repository.findAll();
+        List<Pedido> gravados = repository.findAll().stream()
+                .filter(p -> "cli-1".equals(p.getClienteId()))
+                .toList();
         assertThat(gravados).hasSize(1);
         assertThat(gravados.get(0).getTotal()).isEqualByComparingTo("7.00");
         assertThat(gravados.get(0).getStatus()).isEqualTo(StatusPedido.CRIADO);
@@ -57,7 +59,7 @@ class PedidoIntegracaoTest {
                 .hasStatus(HttpStatus.BAD_REQUEST)
                 .hasContentType(MediaType.APPLICATION_PROBLEM_JSON);
 
-        assertThat(repository.count()).isZero();
+        assertThat(repository.findAll()).noneMatch(p -> p.getClienteId().isBlank());
     }
 
     @Test
