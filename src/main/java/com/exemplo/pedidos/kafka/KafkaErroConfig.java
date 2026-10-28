@@ -26,8 +26,10 @@ public class KafkaErroConfig {
     @Bean
     DefaultErrorHandler errorHandler(KafkaTemplate<Object, Object> template) {
         DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template,
-                (registro, erro) -> new TopicPartition(PEDIDOS_CRIADOS_DLT, registro.partition()));
-
+                (registro, erro) -> registro.topic().equals(PEDIDOS_CRIADOS_DLT)
+                        ? null
+                        : new TopicPartition(PEDIDOS_CRIADOS_DLT, registro.partition()));
+                        
         ExponentialBackOffWithMaxRetries espera = new ExponentialBackOffWithMaxRetries(3);
         espera.setInitialInterval(1_000);
         espera.setMultiplier(2.0);
