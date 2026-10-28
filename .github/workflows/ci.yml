@@ -23,6 +23,25 @@ jobs:
       - name: Build e testes
         run: ./mvnw -B -ntp verify
 
+  infra:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.9.3"
+
+      - name: Formato
+        run: terraform fmt -check -recursive infra
+
+      - name: Validacao
+        run: |
+          for dir in infra infra/orcamento; do
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+
   docker:
     needs: build
     runs-on: ubuntu-24.04
