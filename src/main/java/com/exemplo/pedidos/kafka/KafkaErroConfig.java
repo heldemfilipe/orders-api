@@ -7,7 +7,6 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
-import org.springframework.boot.kafka.autoconfigure.KafkaProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.TopicBuilder;
@@ -32,9 +31,9 @@ public class KafkaErroConfig {
     }
 
     @Bean
-    DefaultErrorHandler errorHandler(KafkaTemplate<Object, Object> templateJson, KafkaProperties propriedades) {
+    DefaultErrorHandler errorHandler(KafkaTemplate<Object, Object> templateJson) {
         KafkaTemplate<String, byte[]> templateBytes = new KafkaTemplate<>(
-                new DefaultKafkaProducerFactory<>(propriedades.buildProducerProperties(),
+                new DefaultKafkaProducerFactory<>(templateJson.getProducerFactory().getConfigurationProperties(),
                         new StringSerializer(), new ByteArraySerializer()));
 
         Map<Class<?>, KafkaOperations<?, ?>> templates = new LinkedHashMap<>();

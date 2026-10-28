@@ -1,7 +1,13 @@
 package com.exemplo.pedidos.kafka;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -14,6 +20,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DuplicateKeyException;
 
 import com.exemplo.pedidos.pedido.Pedido;
 import com.exemplo.pedidos.pedido.PedidoRepository;
@@ -28,14 +35,12 @@ class PedidoCriadoPersistenciaListenerTest {
     @Test
     void gravaPedidoComIdDoEventoEStatusCriado() {
         PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, "8091");
-        PedidoCriado evento = new PedidoCriado(UUID.randomUUID(), UUID.randomUUID(), "cli-1",
-                List.of(new PedidoCriado.Item("caneta", 2, new BigDecimal("3.50"))),
-                new BigDecimal("7.00"), Instant.parse("2026-10-28T15:00:00Z"));
+        PedidoCriado evento = evento(new BigDecimal("7.00"));
 
-        listener.consumir(new ConsumerRecord<>(KafkaTopicConfig.PEDIDOS_CRIADOS, 2, 17L, "cli-1", evento));
+        listener.consumir(registro(evento));
 
         ArgumentCaptor<Pedido> captor = ArgumentCaptor.forClass(Pedido.class);
-        verify(repository).save(captor.capture());
+        verify(repository).insert(captor.capture());
         Pedido pedido = captor.getValue();
 
         assertThat(pedido.getId()).isEqualTo(evento.pedidoId().toString());
@@ -44,5 +49,37 @@ class PedidoCriadoPersistenciaListenerTest {
         assertThat(pedido.getTotal()).isEqualByComparingTo("7.00");
         assertThat(pedido.getCriadoEm()).isEqualTo(Instant.parse("2026-10-28T15:00:00Z"));
         assertThat(pedido.getItens()).hasSize(1);
+    }
+
+    @Test
+    void eventoReentregueEIgnoradoSemErroENuncaSubstituiOPedido() {
+        PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, "8091");
+        when(repository.insert(any(Pedido.class))).thenThrow(new DuplicateKeyException("_id duplicado"));
+
+        assertThatCode(() -> listener.consumir(registro(evento(new BigDecimal("7.00")))))
+                .doesNotThrowAnyException();
+
+        verify(repository, never()).save(any(Pedido.class));
+    }
+
+    @Test
+    void totalNegativoLancaEventoInvalidoSemTocarNoBanco() {
+        PedidoCriadoPersistenciaListener listener = new PedidoCriadoPersistenciaListener(repository, "8091");
+
+        assertThatThrownBy(() -> listener.consumir(registro(evento(new BigDecimal("-1.00")))))
+                .isInstanceOf(EventoInvalidoException.class)
+                .hasMessageContaining("total negativo");
+
+        verifyNoInteractions(repository);
+    }
+
+    private static PedidoCriado evento(BigDecimal total) {
+        return new PedidoCriado(UUID.randomUUID(), UUID.randomUUID(), "cli-1",
+                List.of(new PedidoCriado.Item("caneta", 2, new BigDecimal("3.50"))),
+                total, Instant.parse("2026-10-28T15:00:00Z"));
+    }
+
+    private static ConsumerRecord<String, PedidoCriado> registro(PedidoCriado evento) {
+        return new ConsumerRecord<>(KafkaTopicConfig.PEDIDOS_CRIADOS, 2, 17L, "cli-1", evento);
     }
 }
