@@ -1,0 +1,73 @@
+name: Deploy
+
+# manual de proposito: cada deploy sobe uma tarefa Fargate e o load balancer cobra por hora
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # pede o token OIDC que a AWS troca por credenciais temporarias
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  ECR_REPOSITORY: pedidos-api
+  ECS_CLUSTER: pedidos
+  ECS_SERVICE: pedidos-api
+  ECS_CONTAINER: api
+
+jobs:
+  deploy:
+    # o papel da AWS so confia na main (ver infra/oidc.tf); aqui falha antes, com mensagem clara
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v4
+
+      - id: imagem
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      # parte da definicao que esta no ar (criada pelo Terraform) e troca so a imagem
+      - name: Baixa a definicao de tarefa atual
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_SERVICE" \
+            --query taskDefinition > task-definition.json
+
+      - id: definicao
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.ECS_CONTAINER }}
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.definicao.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Mostra a URL
+        run: |
+          dns=$(aws elbv2 describe-load-balancers --names pedidos-alb \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          echo "API no ar: http://$dns" >> "$GITHUB_STEP_SUMMARY"

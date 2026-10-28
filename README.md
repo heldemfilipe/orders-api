@@ -29,6 +29,9 @@ Uma loja precisa registrar pedidos: quem comprou, o quê, quanto custa e em que 
 | Inspeção do Kafka | Kafka UI (kafbat), porta 8085 |
 | Circuit breaker | Resilience4j 2.4 (`resilience4j-spring-boot4`) |
 | Serviço de frete simulado | WireMock 3.13, porta 8089 |
+| Nuvem | AWS: ECS Fargate, load balancer, ECR e Secrets Manager, declarados em Terraform (`infra/`) |
+| Banco na nuvem | MongoDB Atlas (cluster gratuito) |
+| Deploy | GitHub Actions manual (`workflow_dispatch`), autenticado na AWS por OIDC |
 
 ## Como rodar
 
@@ -330,6 +333,89 @@ No PowerShell, use `curl.exe`. Se esquecer o `reset`, o cenário continua valend
 
 O retry insiste: tenta de novo a mesma chamada, e é bom para falhas **passageiras** (um pico, uma conexão que caiu). Para um serviço **doente**, ele só piora: cada nova tentativa é mais carga em quem já não aguenta, e, num consumer de uma thread só, cada espera trava todas as partições (o experimento 1 mostra isso). O circuit breaker faz o oposto: depois de ver falhas demais, **para de chamar** e responde na hora com o fallback, dando tempo para o serviço voltar. Usá-los juntos faz sentido: um retry curto para o que é passageiro e o breaker para o que persiste. Pela ordem padrão do Resilience4j, o retry envolve o breaker, e então cada tentativa conta como chamada e pode abrir o circuito. Aqui só o circuit breaker está ligado; o retry da Etapa 5 continua no `DefaultErrorHandler`, mas, com o fallback, a exceção do frete nem chega até ele.
 
+## Deploy na nuvem (só o CRUD)
+
+> **Situação:** a infraestrutura e o pipeline estão escritos e foram validados localmente (`terraform fmt`, `validate` e um `plan` sem credenciais, que lista 29 recursos; a imagem Docker foi executada com o perfil `cloud` contra um MongoDB descartável). **Nada foi aplicado em uma conta AWS**, então a URL pública, o `workflow_dispatch` e o `terraform destroy` não foram exercitados. O passo a passo abaixo é o que falta executar.
+
+Kafka, consumers, DLT e o serviço de frete ficam só no ambiente local: a nuvem não enxerga o Docker do computador, e Kafka gerenciado gratuito praticamente não existe. Na nuvem sobe apenas o CRUD (`/pedidos`) com MongoDB Atlas.
+
+```
+GitHub Actions ──OIDC──▶ papel pedidos-github-deploy
+     │ build da imagem
+     ▼
+    ECR ──▶ nova revisão da tarefa ──▶ ECS service (Fargate, perfil cloud)
+                                              ▲            │ MONGODB_URI
+Internet ──▶ load balancer :80 ───────────────┘            ▼ (Secrets Manager)
+              health check /actuator/health        MongoDB Atlas (mongodb+srv, TLS)
+```
+
+### O perfil `cloud`
+
+Ativado por `SPRING_PROFILES_ACTIVE=cloud` (a definição de tarefa já o define). Ele:
+
+- exclui a autoconfiguração do Kafka (`application-cloud.yaml`) e as classes que dependem do Kafka ou do frete usam `@Profile("!cloud")`: listeners, publisher, `POST /pedidos/eventos`, configuração de erro e DLT, tópicos, `FreteClient`. Sem isso, a aplicação tentaria falar com um broker que não existe;
+- lê o MongoDB só de `MONGODB_URI`, **sem valor padrão**. Se o segredo não chegar, a aplicação não sobe (o erro é `The connection string is invalid`, porque o Spring deixa o `${MONGODB_URI}` literal);
+- expõe só `/actuator/health` e desliga o Swagger e o `/v3/api-docs`, porque a API fica na internet e sem autenticação;
+- ativa o encerramento gracioso, para o deploy não cortar requisições em andamento.
+
+Para ver o mesmo perfil localmente, com o MongoDB do Compose:
+
+```bash
+SPRING_PROFILES_ACTIVE=cloud MONGODB_URI="mongodb://pedidos:pedidos@localhost:27017/pedidos?authSource=admin" ./mvnw spring-boot:run
+```
+
+Na resposta de `GET /pedidos/{id}`, `frete` vem `null` e `freteEstimado` falso para os pedidos criados na nuvem: ninguém consulta o frete lá.
+
+### O que existe em `infra/`
+
+| Arquivo | Recursos |
+| --- | --- |
+| `rede.tf` | VPC própria com duas subnets públicas e sem NAT gateway; security group do load balancer (porta 80) e da tarefa (porta 8080, só a partir do load balancer) |
+| `alb.tf` | Application Load Balancer, target group com health check em `/actuator/health` e listener HTTP |
+| `ecr.tf` | Repositório de imagens (as 5 mais recentes ficam) |
+| `segredos.tf` | O segredo `pedidos/mongodb-uri`, **sem valor**: a connection string não passa pelo Terraform |
+| `ecs.tf` | Cluster, serviço Fargate, definição de tarefa inicial, logs no CloudWatch (7 dias) e o papel de execução, que só lê aquele segredo |
+| `oidc.tf` | Provedor OIDC do GitHub e o papel `pedidos-github-deploy`, que só a branch `main` deste repositório pode assumir |
+| `orcamento/` | Alerta no AWS Budgets, em um Terraform à parte para o `destroy` da API não apagá-lo |
+
+### Passo a passo
+
+1. **Alerta de custo, antes de tudo.** Em `infra/orcamento`: copie `terraform.tfvars.example` para `terraform.tfvars`, ponha o seu e-mail e rode `terraform init` e `terraform apply`. Avisa quando o gasto real passa de 50% e de 80% do limite (US$ 10 por padrão) e quando a previsão passa de 100%. O Budgets atrasa horas: é um alarme, não um freio.
+2. **MongoDB Atlas.** Crie o cluster gratuito, um usuário com permissão `readWrite` só no banco `pedidos` e, em *Network Access*, a lista de IPs (veja o trade-off abaixo). Copie a connection string `mongodb+srv://...` **com `/pedidos` no caminho**.
+3. **Infraestrutura.** Em `infra`: copie `terraform.tfvars.example` para `terraform.tfvars` (restrinja `cidrs_permitidos` ao seu IP, se puder) e rode `terraform init` e `terraform apply`. Se a conta já tiver o provedor OIDC do GitHub, use `criar_provedor_oidc = false`.
+4. **Segredo.** Grave a connection string fora do Terraform:
+
+   ```bash
+   aws secretsmanager put-secret-value --secret-id pedidos/mongodb-uri --secret-string "mongodb+srv://USUARIO:SENHA@cluster.xxxxx.mongodb.net/pedidos"
+   ```
+
+5. **Variáveis do repositório** (Settings → Secrets and variables → Actions → *Variables*; não são segredos): `AWS_ROLE_ARN` e `AWS_REGION`, com os valores de `terraform output`.
+6. **Deploy.** Com tudo isso na `main`, rode o workflow *Deploy* (Actions → Deploy → Run workflow). Até esse primeiro deploy, o serviço tenta subir a imagem `:inicial`, que não existe, e as tarefas falham em baixar a imagem: é esperado. O workflow constrói a imagem, envia ao ECR, registra uma revisão nova da tarefa e espera o serviço ficar estável (as tarefas saudáveis no load balancer).
+7. **Teste.** Com a URL de `terraform output url_api`:
+
+   ```bash
+   curl -i -X POST http://URL/pedidos -H "Content-Type: application/json" -d '{"clienteId":"cli-1","itens":[{"produto":"caneta","quantidade":2,"precoUnitario":3.50}]}'
+   curl -i http://URL/pedidos
+   ```
+
+8. **Desligar.** `terraform destroy` em `infra` remove tudo, inclusive as imagens do ECR e o segredo (sem janela de recuperação, senão o nome ficaria preso por 30 dias). O alerta do Budgets continua; apague-o em `infra/orcamento` quando quiser. Pause o cluster do Atlas ou apague-o no console.
+
+### Custo
+
+O load balancer cobra **por hora, mesmo sem tráfego**, e a tarefa Fargate também enquanto estiver rodando. Os preços mudam: confira a página de preços da AWS da região escolhida antes de subir e rode o `destroy` ao terminar. `quantidade_tarefas = 0` desliga a API sem destruir o resto, mas o load balancer continua cobrando.
+
+### Trade-offs
+
+- **`0.0.0.0/0` no Atlas.** As tarefas Fargate recebem um IP público diferente a cada início, e o Atlas só aceita uma lista de IPs. Liberar todos resolve para estudo, mas deixa o banco exposto à internet; o que o protege é o usuário com senha, a permissão mínima (`readWrite` em um banco) e o TLS. Em produção, o caminho é privado: VPC peering ou *private link* com o Atlas, e a lista de IPs fechada.
+- **Sem NAT gateway.** Ele daria à tarefa um IP de saída fixo (que poderia entrar na lista do Atlas, no lugar de `0.0.0.0/0`), mas cobra por hora e seria o maior custo parado do projeto. Em troca, as tarefas ficam em subnet pública com IP público; quem as isola é o security group, que só aceita o load balancer.
+- **HTTP puro.** Sem domínio próprio não há certificado no ACM. Em produção seriam HTTPS na 443 e redirecionamento da 80.
+- **A API é pública e não tem autenticação.** Qualquer um com a URL grava pedidos. Por isso `cidrs_permitidos` existe: para estudo, deixe só o seu IP. O Swagger fica desligado na nuvem pelo mesmo motivo.
+- **O segredo fora do Terraform.** O valor no `terraform.tfvars` ou no state iria parar em arquivo local em texto puro. O custo é um passo manual (o `put-secret-value`).
+- **O health check inclui o MongoDB.** `/actuator/health` fica `DOWN` se o Atlas não responde, e o load balancer tira a tarefa de circulação. Isso evita servir erro, mas um problema no Atlas derruba a API inteira; um *liveness* separado do *readiness* resolveria, e não foi feito.
+- **State local do Terraform.** Suficiente para estudo e para uma pessoa. Em equipe, o state ficaria em um bucket S3 com bloqueio.
+- **Deploy manual e confiança restrita.** O `workflow_dispatch` evita que um merge crie custo sem querer. O papel da AWS só aceita o token da branch `main` deste repositório, então o workflow disparado de outra branch falha ao assumir o papel. As permissões do papel se limitam ao repositório de imagens, ao serviço e ao papel de execução.
+- **O Terraform cria a definição de tarefa; o pipeline a substitui.** Cada deploy registra uma revisão nova com a imagem do commit, e o serviço ignora mudanças em `task_definition` para um `apply` não voltar para a imagem `:inicial`. Em compensação, mudar CPU, memória ou variáveis de ambiente pelo Terraform não chega ao serviço em execução sem um novo deploy.
+
 ## Testes
 
 ```bash
@@ -350,6 +436,8 @@ Os testes de integração usam Testcontainers e sobem um MongoDB 7.0, um Kafka e
 | `ConsumersIntegracaoTest` | Um `POST /pedidos/eventos` vira pedido (consultável por `GET /pedidos/{pedidoId}`) e auditoria. O mesmo evento entregue duas vezes gera um pedido e duas auditorias. **A reentrega não desfaz uma alteração**: um pedido pago continua `PAGO` depois de o evento voltar |
 | `FalhasIntegracaoTest` | Um evento com `total` negativo vai para a DLT depois das tentativas, é registrado em `mensagens_falhas` e não vira pedido. Uma mensagem malformada vai para a DLT com o texto original (uma vez por group) e a mensagem válida que vem depois, na mesma partição, é processada |
 | `FreteIntegracaoTest` | O frete normal chega ao pedido (`12.50`, não estimado) e o circuito fica fechado. Com o serviço devolvendo 500, as 10 primeiras chamadas abrem o circuito, as seguintes **não tocam no serviço** (o WireMock conta as requisições) e valem o frete padrão. Com o serviço recuperado e o circuito em meio-aberto, 3 chamadas de teste o fecham. Uma resposta acima de 2 s conta como chamada lenta, e não como falha. De ponta a ponta: com o serviço fora do ar, o pedido é gravado com `freteEstimado` verdadeiro e **não** vai para a DLT |
+
+| `PerfilCloudIntegracaoTest` | Com o perfil `cloud` e **só um MongoDB** (sem container de Kafka), o contexto sobe sem `KafkaTemplate`, listeners nem `FreteClient`; o CRUD funciona; `POST /pedidos/eventos` deixa de existir (`405`); só `/actuator/health` está exposto, e o Swagger e o `/v3/api-docs` respondem `404` |
 
 Os consumers rodam em outra thread, então os testes que dependem deles **esperam com Awaitility** (`await().atMost(...).untilAsserted(...)`) em vez de `Thread.sleep`: conferem repetidamente e terminam assim que a condição passa. Os testes de eventos e de consumers usam `clienteId` e ids próprios, porque o Mongo e o Kafka de teste são compartilhados entre as classes, e nenhum teste confere o tamanho da coleção inteira. Para checar que a suíte não depende da ordem de execução:
 
@@ -401,6 +489,17 @@ src/main/java/com/exemplo/pedidos
 └── erro
     ├── GlobalExceptionHandler.java                      erros viram ProblemDetail
     └── *Exception.java
+
+src/main/resources
+├── application.yaml                                     configuração local (Kafka, frete, circuit breaker)
+└── application-cloud.yaml                               perfil cloud: sem Kafka, MongoDB por MONGODB_URI
+
+infra                                                    Terraform da AWS (veja "Deploy na nuvem")
+└── orcamento                                            alerta de custo, com state próprio
+
+.github/workflows
+├── ci.yml                                               build e testes, validação do Terraform e imagem Docker
+└── deploy.yml                                           deploy manual na AWS, por OIDC
 ```
 
 ## Decisões e trade-offs
@@ -441,6 +540,10 @@ src/main/java/com/exemplo/pedidos
 - **`minimum-number-of-calls: 10` e `automatic-transition-from-open-to-half-open-enabled`.** O padrão do primeiro é 100, o que faria o circuito demorar a abrir numa janela de 10. O segundo faz o `HALF_OPEN` aparecer no Actuator sem depender de tráfego.
 - **O estado do circuito é por instância da aplicação.** Fica em memória, na JVM. Duas instâncias do consumer abrem e fecham o circuito cada uma por si, sem coordenação.
 - **Limitação conhecida: erros 4xx também contam como falha.** O Resilience4j registra qualquer exceção por padrão, inclusive o `HttpClientErrorException` de um 400 ou 404. Se o serviço respondesse 4xx por culpa do chamador, o circuito poderia abrir sem o serviço estar doente. O ajuste seria `ignore-exceptions` para essa classe, que não foi aplicado.
+- **ECS Fargate com Terraform, e não Elastic Beanstalk.** O Beanstalk daria menos trabalho, mas esconderia a rede, os papéis e o balanceador que a Etapa 7 quer mostrar. O Lambda foi descartado: exigiria adaptar o Spring e sofreria com a partida a frio da JVM.
+- **Perfil `cloud` por `@Profile("!cloud")`, e não por uma propriedade `kafka.enabled`.** O roteiro pedia um perfil, e ele já agrupa a configuração da nuvem em um arquivo. O custo é que a marcação está espalhada em 10 classes: quem criar um novo componente de Kafka precisa lembrar dela. O `PerfilCloudIntegracaoTest` pega o esquecimento, porque o contexto de teste não tem broker.
+- **A configuração da nuvem não esconde falha.** `MONGODB_URI` sem padrão e `application-cloud.yaml` sem caminho para o MongoDB local: uma API da nuvem que caísse silenciosamente no `localhost` seria pior do que uma que não sobe.
+- **O `terraform validate` e o `plan` offline não provam o deploy.** Eles garantem que a configuração é coerente (referências, tipos, 29 recursos), mas não que as permissões do papel bastam, que a conta tem cotas ou que o ECS consegue puxar a imagem. Essas falhas só aparecem no primeiro `apply` e no primeiro deploy.
 - **O WireMock serve ao Compose e aos testes.** Os mesmos stubs de `wiremock/mappings` sobem no Compose e dentro do `TestcontainersConfiguration`, e os testes aplicam os cenários de `wiremock/cenarios` pela API administrativa. O estado do circuito e o WireMock são compartilhados entre as classes que reaproveitam o contexto do Spring, então o `FreteIntegracaoTest` restaura os dois antes e depois de cada teste.
 
 ## Roteiro
@@ -451,7 +554,7 @@ src/main/java/com/exemplo/pedidos
 - [x] Etapa 4: consumers e consumer groups
 - [x] Etapa 5: retry, dead-letter e idempotência
 - [x] Etapa 6: circuit breaker com Resilience4j
-- [ ] Etapa 7: deploy do CRUD na nuvem
+- [ ] Etapa 7: deploy do CRUD na nuvem (infraestrutura, pipeline e perfil `cloud` escritos e validados localmente; falta aplicar na AWS)
 
 ## Licença
 
