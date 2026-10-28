@@ -1,0 +1,8 @@
+{
+  "request": { "method": "GET", "urlPath": "/frete" },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "jsonBody": { "valor": 12.50, "prazoDias": 3 }
+  }
+}
