@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
+import org.springframework.dao.DuplicateKeyException;
 
 import com.exemplo.pedidos.pedido.ItemPedido;
 import com.exemplo.pedidos.pedido.Pedido;
@@ -40,9 +41,14 @@ public class PedidoCriadoPersistenciaListener {
 
         Pedido pedido = new Pedido(evento.pedidoId().toString(), evento.clienteId(), itens,
                 evento.total(), StatusPedido.CRIADO, evento.ocorridoEm());
-        repository.save(pedido);
+        try {
+            repository.insert(pedido);
+        } catch (DuplicateKeyException e) {
+            log.warn("[persistencia][instancia {}] pedido {} ja existe (evento {} reentregue), ignorando",
+                    instancia, pedido.getId(), evento.eventId());
+            return;
+        }
 
         log.info("[persistencia][instancia {}] pedido {} gravado (cliente {}, particao {}, offset {})",
-                instancia, pedido.getId(), evento.clienteId(), registro.partition(), registro.offset());
-    }
+                instancia, pedido.getId(), evento.clienteId(), registro.partition(), registro.offset());    }
 }
