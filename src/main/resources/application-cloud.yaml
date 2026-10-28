@@ -1,0 +1,25 @@
+# perfil da nuvem: so o CRUD. Kafka, consumers, DLT e frete (circuit breaker) ficam no perfil padrao.
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.kafka.autoconfigure.KafkaAutoConfiguration
+  mongodb:
+    # sem valor padrao de proposito: se o segredo nao chegar, a aplicacao nao sobe
+    uri: ${MONGODB_URI}
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false

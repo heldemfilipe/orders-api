@@ -9,6 +9,7 @@ import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.Headers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Profile;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.stereotype.Component;
@@ -16,6 +17,7 @@ import org.springframework.stereotype.Component;
 import com.exemplo.pedidos.falha.MensagemFalha;
 import com.exemplo.pedidos.falha.MensagemFalhaRepository;
 
+@Profile("!cloud")
 @Component
 public class DeadLetterListener {
 

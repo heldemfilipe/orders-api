@@ -4,6 +4,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
+import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Service;
 
 import com.exemplo.pedidos.kafka.PedidoCriado;
@@ -12,6 +13,7 @@ import com.exemplo.pedidos.pedido.dto.ItemRequest;
 import com.exemplo.pedidos.pedido.dto.PedidoAceito;
 import com.exemplo.pedidos.pedido.dto.PedidoRequest;
 
+@Profile("!cloud")
 @Service
 public class PedidoEventoService {
 
