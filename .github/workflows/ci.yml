@@ -76,3 +76,28 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # GitOps: depois que a imagem é publicada, abre um PR no eks-gitops-config com a tag nova.
+  # O deploy no cluster é o Argo CD sincronizando depois do merge; este job não toca no cluster.
+  atualiza-config:
+    needs: docker
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Abre o PR no eks-gitops-config
+        env:
+          # Token com acesso só ao repositório de config (contents e pull requests)
+          GH_TOKEN: ${{ secrets.CONFIG_REPO_TOKEN }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE_TAG: sha-${{ github.sha }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::CONFIG_REPO_TOKEN não configurado; o PR no config não foi aberto."
+            exit 0
+          fi
+          bash .github/scripts/atualizar-config.sh
