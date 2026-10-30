@@ -16,7 +16,13 @@ management:
   endpoints:
     web:
       exposure:
-        include: health
+        # prometheus: raspado pelo ServiceMonitor no Kubernetes (eks-gitops-config)
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        # /actuator/health/liveness e /readiness para as probes do Kubernetes
+        enabled: true
 
 springdoc:
   api-docs:

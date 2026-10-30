@@ -505,6 +505,17 @@ O load balancer cobra **por hora, mesmo sem tráfego**, e a tarefa Fargate tamb�
 - **Deploy manual e confiança restrita.** O `workflow_dispatch` evita que um merge crie custo sem querer. O papel da AWS só aceita o token da branch `main` deste repositório, então o workflow disparado de outra branch falha ao assumir o papel. As permissões do papel se limitam ao repositório de imagens, ao serviço e ao papel de execução.
 - **O Terraform cria a definição de tarefa; o pipeline a substitui.** Cada deploy registra uma revisão nova com a imagem do commit, e o serviço ignora mudanças em `task_definition` para um `apply` não voltar para a imagem `:inicial`. Em compensação, mudar CPU, memória ou variáveis de ambiente pelo Terraform não chega ao serviço em execução sem um novo deploy.
 
+## Entrega no Kubernetes (GitOps)
+
+A API também roda num cluster Kubernetes gerenciado por GitOps: o projeto [eks-gitops-platform](https://github.com/heldemfilipe/eks-gitops-platform) cria o cluster e o [eks-gitops-config](https://github.com/heldemfilipe/eks-gitops-config) guarda os manifestos que o Argo CD lê. Neste repositório entram só duas peças:
+
+| Peça | O que faz |
+| --- | --- |
+| Perfil `cloud` | Expõe `/actuator/health/liveness`, `/actuator/health/readiness` (probes) e `/actuator/prometheus` (métricas), cobertos por testes em `PerfilCloudIntegracaoTest` |
+| Job `atualiza-config` do `ci.yml` | Depois de publicar a imagem `sha-<commit>`, roda `.github/scripts/atualizar-config.sh`, que troca a tag no config e **abre um pull request**. O deploy é o Argo CD sincronizando depois do merge |
+
+O job usa o secret `CONFIG_REPO_TOKEN`, um token com acesso só ao repositório de config (contents e pull requests). Sem o secret, o job avisa e termina sem abrir o PR. O script aceita `DRY_RUN=1` para mostrar o diff sem enviar nada.
+
 ## Testes
 
 ```bash
@@ -643,6 +654,7 @@ infra                                                    Terraform da AWS (veja 
 - [x] Etapa 6: circuit breaker com Resilience4j
 - [x] Etapa 7: deploy do CRUD na nuvem
 - [x] Etapa 8 (opcional): arquitetura hexagonal
+- [x] Etapa 9 (opcional): entrega GitOps no Kubernetes (métricas, probes e PR automático no repositório de config)
 
 ## Licença
 
