@@ -512,9 +512,9 @@ A API também roda num cluster Kubernetes gerenciado por GitOps: o projeto [eks-
 | Peça | O que faz |
 | --- | --- |
 | Perfil `cloud` | Expõe `/actuator/health/liveness`, `/actuator/health/readiness` (probes) e `/actuator/prometheus` (métricas), cobertos por testes em `PerfilCloudIntegracaoTest` |
-| Job `atualiza-config` do `ci.yml` | Depois de publicar a imagem `sha-<commit>`, roda `.github/scripts/atualizar-config.sh`, que troca a tag no config e **abre um pull request**. O deploy é o Argo CD sincronizando depois do merge |
+| Script `.github/scripts/atualizar-config.sh` | Roda **na máquina**, não no CI: troca a tag da imagem no config e **abre um pull request**. O deploy é o Argo CD sincronizando depois do merge |
 
-O job usa o secret `CONFIG_REPO_TOKEN`, um token com acesso só ao repositório de config (contents e pull requests). Sem o secret, o job avisa e termina sem abrir o PR. O script aceita `DRY_RUN=1` para mostrar o diff sem enviar nada.
+O script usa `IMAGE`, `IMAGE_TAG` e `SOURCE_URL` (variáveis) e o `gh` já autenticado. `DRY_RUN=1` mostra o diff sem enviar nada. Nenhum job do `ci.yml` chama o script: o CI só testa e publica a imagem, e abrir o PR no config é um passo manual.
 
 ## Testes
 
