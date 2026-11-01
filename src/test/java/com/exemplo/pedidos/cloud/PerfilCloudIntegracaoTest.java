@@ -22,7 +22,12 @@ import org.testcontainers.mongodb.MongoDBContainer;
 import com.exemplo.pedidos.application.port.out.FretePort;
 
 // sem container de Kafka: se alguma classe do perfil cloud ainda precisasse do broker, o contexto nao subiria
-@SpringBootTest(properties = "MONGODB_URI=mongodb://substituida-pelo-testcontainers:27017/pedidos")
+// os testes desligam a exportacao de metricas por padrao; aqui ela e religada para provar o /actuator/prometheus
+@SpringBootTest(properties = {
+        "MONGODB_URI=mongodb://substituida-pelo-testcontainers:27017/pedidos",
+        "management.defaults.metrics.export.enabled=true",
+        "management.prometheus.metrics.export.enabled=true"
+})
 @AutoConfigureMockMvc
 @ActiveProfiles("cloud")
 @Import(PerfilCloudIntegracaoTest.SoMongo.class)
@@ -81,11 +86,29 @@ class PerfilCloudIntegracaoTest {
     }
 
     @Test
-    void healthSobeEApenasOHealthEstaExposto() {
+    void healthSobeEOQueNaoEDaNuvemNaoEstaExposto() {
         assertThat(mvc.get().uri("/actuator/health"))
                 .hasStatusOk()
                 .bodyJson().extractingPath("$.status").isEqualTo("UP");
         assertThat(mvc.get().uri("/actuator/circuitbreakers")).hasStatus(HttpStatus.NOT_FOUND);
+        assertThat(mvc.get().uri("/actuator/env")).hasStatus(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void probesDeLivenessEReadinessParaOKubernetes() {
+        assertThat(mvc.get().uri("/actuator/health/liveness"))
+                .hasStatusOk()
+                .bodyJson().extractingPath("$.status").isEqualTo("UP");
+        assertThat(mvc.get().uri("/actuator/health/readiness"))
+                .hasStatusOk()
+                .bodyJson().extractingPath("$.status").isEqualTo("UP");
+    }
+
+    @Test
+    void metricasNoFormatoDoPrometheus() {
+        assertThat(mvc.get().uri("/actuator/prometheus"))
+                .hasStatusOk()
+                .bodyText().contains("jvm_memory_used_bytes");
     }
 
     @Test
