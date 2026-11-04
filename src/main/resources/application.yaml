@@ -22,6 +22,10 @@ spring:
         spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
         spring.json.use.type.headers: false
         spring.json.value.default.type: com.exemplo.pedidos.adapter.kafka.PedidoCriado
+pedidos:
+  mongodb:
+    # sem servidor, a requisicao falha em 3 s com 503 (o padrao do driver e 30 s)
+    server-selection-timeout: 3s
 frete:
   url: ${FRETE_URL:http://localhost:8089}
   timeout-conexao: 1s

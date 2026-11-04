@@ -3,6 +3,7 @@ package com.exemplo.pedidos.adapter.in.rest;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -41,6 +42,15 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         ProblemDetail problema = ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
                 "Não foi possível enviar o pedido para processamento. Tente novamente.");
         problema.setTitle("Fila indisponível");
+        return problema;
+    }
+
+    // sem servidor de banco (o driver desiste depois de pedidos.mongodb.server-selection-timeout): 503, nao 500
+    @ExceptionHandler(DataAccessResourceFailureException.class)
+    public ProblemDetail bancoIndisponivel(DataAccessResourceFailureException ex) {
+        ProblemDetail problema = ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+                "O banco de dados não respondeu. Tente novamente em instantes.");
+        problema.setTitle("Banco indisponível");
         return problema;
     }
 
